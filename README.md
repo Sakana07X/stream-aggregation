@@ -55,6 +55,7 @@ SnowLuma → OneBot WebSocket → 流式聚合 → SQLite
 - [架构说明](docs/architecture.md) — 代码分层与消息处理链路
 - [完整项目计划](PROJECT_PLAN.md)
 - [项目介绍](PROJECT_INTRODUCTION.md)
+- [后续开发计划](docs/NEXT_STEPS.md)
 
 ## 许可
 
