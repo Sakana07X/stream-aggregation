@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/StreamingAggregation.App/StreamingAggregation.App.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/StreamingAggregation.Core/StreamingAggregation.Core.csproj" />
+    <Project Path="src/StreamingAggregation.Infrastructure/StreamingAggregation.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/StreamingAggregation.Tests/StreamingAggregation.Tests.csproj" />
+  </Folder>
+</Solution>

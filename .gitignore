@@ -1,22 +1,46 @@
-# SnowLuma 本机运行时和真实数据
-SnowLuma-v1.14.22-win-x64/data/
-SnowLuma-v1.14.22-win-x64/logs/
-SnowLuma-v1.14.22-win-x64/config/
-SnowLuma-v1.14.22-win-x64/client/
-SnowLuma-v1.14.22-win-x64/native/
+# ---- 本机运行时：SnowLuma 发行包与真实数据 ----
+# 整个目录都不入库：其中既有 80MB+ 的第三方发行二进制（node.exe / index.mjs 等），
+# 也有本机真实运行数据（消息库、日志、配置与 token）。两者都不能进公开仓库。
+SnowLuma-*/
+SnowLuma/
 
+# ---- 应用运行数据 ----
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+logs/
+attachments/
+
+# ---- 密钥材料 ----
+# DPAPI 密文虽然已加密，但仍是本机凭据副本，不应随仓库分发
+secrets/
+secrets.dat
+*.dat
+*.pfx
+*.p12
+*.key
+*.pem
+
+# ---- 构建产物与本机临时文件 ----
 .tmp/
 **/bin/
 **/obj/
 artifacts/
 publish/
+*.binlog
+
+# ---- 环境与本机配置 ----
 .env
 .env.*
 *.user
 *.suo
-secrets/
-*.db
-*.db-shm
-*.db-wal
-logs/
-attachments/
+.vs/
+.idea/
+
+# ---- 操作系统垃圾 ----
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,40 @@
+<Window x:Class="StreamingAggregation.App.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <Grid>
+        <Grid x:Name="AppTitleBar" Height="48" VerticalAlignment="Top" />
+
+        <NavigationView x:Name="NavView"
+                        Loaded="NavView_Loaded"
+                        SelectionChanged="NavView_SelectionChanged"
+                        IsBackEnabled="False"
+                        BackRequested="NavView_BackRequested">
+            <NavigationView.MenuItems>
+                <NavigationViewItem Icon="Document" Content="摘要" Tag="DigestPage" />
+                <NavigationViewItem Icon="Edit" Content="待办" Tag="TodoPage" />
+                <NavigationViewItem Icon="Message" Content="消息" Tag="MessagesPage" />
+                <NavigationViewItem Icon="Setting" Content="设置" Tag="SettingsPage" />
+            </NavigationView.MenuItems>
+
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <!-- 连接状态条：内容由 ConnectionStatusViewModel 推送 -->
+                <Border Grid.Row="0"
+                        Padding="12,4"
+                        BorderThickness="0,0,0,1">
+                    <TextBlock x:Name="StatusText"
+                               Text="未连接"
+                               Style="{ThemeResource CaptionTextBlockStyle}"
+                               TextTrimming="CharacterEllipsis" />
+                </Border>
+
+                <Frame x:Name="ContentFrame" Grid.Row="1" Padding="12,0,12,0" />
+            </Grid>
+        </NavigationView>
+    </Grid>
+</Window>

@@ -1,0 +1,33 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>StreamingAggregation.Infrastructure</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Microsoft.Data.Sqlite.Core（不含原生库）+ SQLitePCLRaw.bundle_e_sqlite3 提供原生 e_sqlite3。
+      注意：SQLitePCLRaw 必须锁 3.0.5，2.1.10 存在 NU1903 已知漏洞。
+    -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.13" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.5" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\StreamingAggregation.Core\StreamingAggregation.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 迁移脚本以嵌入资源方式随程序集分发，单文件发布无需额外携带 .sql。 -->
+    <EmbeddedResource Include="Persistence\Migrations\*.sql" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="StreamingAggregation.Tests" />
+  </ItemGroup>
+
+</Project>

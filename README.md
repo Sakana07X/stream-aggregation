@@ -2,7 +2,7 @@
 
 面向 Windows 的 QQ 群消息聚合与智能摘要客户端。它连接本机运行的 SnowLuma，接收指定 QQ 群消息，过滤闲聊，按时间窗口聚合内容，再通过可配置的大模型生成摘要和待办。
 
-> 当前项目处于设计与开发准备阶段。
+> 首版功能已可运行，界面页面仍在完善中。
 
 ## 计划解决的问题
 
@@ -38,18 +38,21 @@ SnowLuma → OneBot WebSocket → 流式聚合 → SQLite
 %LOCALAPPDATA%\流式聚合\
 ```
 
-首版使用本地 SQLite，不修改 SnowLuma 的数据库。SnowLuma 运行数据、QQ 消息、日志、token 和模型 API Key 不应提交到仓库。敏感配置计划使用 Windows DPAPI 加密保存。
+首版使用本地 SQLite，不修改 SnowLuma 的数据库。SnowLuma 运行数据、QQ 消息、日志、token 和模型 API Key 不应提交到仓库。Token 和 API Key 使用 Windows DPAPI 加密后保存在 `secrets.dat`，明文不落盘。
 
 ## 当前状态
 
 - 项目计划：已建立。
-- Windows 客户端：尚未完成。
+- Windows 客户端：消息管线已跑通，界面页面待完善。
 - 手机网页：暂缓。
 - 图片和文件解析：暂缓。
 - 外部通知渠道：暂缓。
 
 ## 文档
 
+- [使用说明](docs/usage.md) — 首次配置步骤与日常操作
+- [配置说明](docs/configuration.md) — 每个设置项的含义与取值范围
+- [架构说明](docs/architecture.md) — 代码分层与消息处理链路
 - [完整项目计划](PROJECT_PLAN.md)
 - [项目介绍](PROJECT_INTRODUCTION.md)
 

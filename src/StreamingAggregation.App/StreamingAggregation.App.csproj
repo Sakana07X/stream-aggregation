@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    WinUI 3 unpackaged 应用骨架。
+    说明：本机没有 `dotnet new winui` 模板，故手写本文件；配置取自已实测通过的探针工程。
+    注意：入口点由 XAML 标记编译器自动生成（App.xaml 被登记为 ApplicationDefinition，
+    生成 obj/...\App.g.i.cs 内的 Program.Main）。本项目禁止添加 Program.cs 或 Main 方法，
+    否则会触发 CS0017 入口点冲突。
+  -->
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>StreamingAggregation.App</RootNamespace>
+    <AssemblyName>StreamingAggregation.App</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!-- WinUI / unpackaged 必需配置 -->
+  <PropertyGroup>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <!-- 让 WindowsAppSDK 的 Microsoft.WinUI.props 自动把 Assets\**\*.* 收进 Content -->
+    <EnableDefaultAssets>true</EnableDefaultAssets>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
+    <!-- 托盘/窗口图标占位（Assets\AppIcon.ico） -->
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.250606001" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
+    <PackageReference Include="H.NotifyIcon.WinUI" Version="2.4.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\StreamingAggregation.Core\StreamingAggregation.Core.csproj" />
+    <ProjectReference Include="..\StreamingAggregation.Infrastructure\StreamingAggregation.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Update="Assets\**">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>
