@@ -1,0 +1,22 @@
+# SnowLuma 本机运行时和真实数据
+SnowLuma-v1.14.22-win-x64/data/
+SnowLuma-v1.14.22-win-x64/logs/
+SnowLuma-v1.14.22-win-x64/config/
+SnowLuma-v1.14.22-win-x64/client/
+SnowLuma-v1.14.22-win-x64/native/
+
+.tmp/
+**/bin/
+**/obj/
+artifacts/
+publish/
+.env
+.env.*
+*.user
+*.suo
+secrets/
+*.db
+*.db-shm
+*.db-wal
+logs/
+attachments/
