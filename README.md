@@ -55,4 +55,4 @@ SnowLuma → OneBot WebSocket → 流式聚合 → SQLite
 
 ## 许可
 
-项目许可协议尚未确定。
+本项目采用 [MIT License](LICENSE)。
