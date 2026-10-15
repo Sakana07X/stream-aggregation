@@ -53,7 +53,6 @@ SnowLuma → OneBot WebSocket → 流式聚合 → SQLite
 - [使用说明](docs/usage.md) — 首次配置步骤与日常操作
 - [配置说明](docs/configuration.md) — 每个设置项的含义与取值范围
 - [架构说明](docs/architecture.md) — 代码分层与消息处理链路
-- [完整项目计划](PROJECT_PLAN.md)
 - [项目介绍](PROJECT_INTRODUCTION.md)
 - [后续开发计划](docs/NEXT_STEPS.md)
 

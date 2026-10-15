@@ -1,38 +1,38 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Text;
-using StreamingAggregation.Tests.Fixtures;
 
 namespace StreamingAggregation.Tests.Composition;
 
 /// <summary>
-/// 真实 git 行为测试：仓库根 <c>.gitignore</c> 必须挡住 DPAPI 密钥库及其伴生文件。
+/// 真实 git 行为测试：密钥保护规则必须挡住 DPAPI 密钥库及其伴生文件。
 /// </summary>
 /// <remarks>
 /// <para>
 /// <b>为什么不能用源码正则断言</b>：<c>.gitignore</c> 的匹配语义由 git 自己实现
 /// （锚定、目录性、negation、通配符优先级），正则模拟必然与真实行为漂移。这里在临时目录
-/// <c>git init</c>、拷贝真实 <c>.gitignore</c>、造出密钥文件，跑真实的 <c>git add -A</c>，
+/// <c>git init</c>、写入密钥保护规则、造出密钥文件，跑真实的 <c>git add -A</c>，
 /// 再读 <c>git ls-files</c>——断言的是 git 的真实决定，不是我们的猜测。
 /// </para>
 /// <para>
 /// <b>守护的回归</b>：<see cref="StreamingAggregation.Infrastructure.Security.DpapiSecretStore"/>
 /// 把密文写到 <c>%LOCALAPPDATA%\流式聚合\secrets.dat</c>，写坏时还会隔离出
 /// <c>secrets.dat.corrupt</c>。一旦有人误把密钥库配置改成落在仓库内
-/// （或把 <c>secrets.dat.*</c> 这类配套模式从 <c>.gitignore</c> 里删掉），
+/// （或把 <c>secrets.dat.*</c> 这类配套模式删掉），
 /// 本机凭据副本就会跟着 <c>git add -A</c> 进暂存区，随下一次 push 公开。
 /// </para>
 /// <para>
 /// <b>为什么必须自包含</b>：测试绝不在真实仓库里跑 <c>git add</c>，那会污染用户的暂存区。
 /// 每个用例都在 <see cref="Path.GetTempPath"/> 下自建独立仓库，并屏蔽全局 git 配置
-/// （<c>GIT_CONFIG_GLOBAL</c>），保证结果只由本仓库的 <c>.gitignore</c> 决定。
-/// 仓库根路径由 <see cref="RepositoryRootLocator"/> 从程序集位置向上查找，不依赖进程 CWD。
+/// （<c>GIT_CONFIG_GLOBAL</c>），保证结果只由测试写入的规则决定。
 /// </para>
 /// </remarks>
 public sealed class GitIgnoreSecretFileProtectionTests : IDisposable
 {
-    /// <summary>仓库根 <c>.gitignore</c> 的文件名。</summary>
+    /// <summary>临时测试仓库的忽略文件名。</summary>
     private const string GitIgnoreFileName = ".gitignore";
+    /// <summary>应用密钥库及其损坏备份必须被忽略。</summary>
+    private const string SecretIgnoreRules = "secrets.dat\nsecrets.dat.*\n";
 
     /// <summary>不能被 git 跟踪的密钥文件。</summary>
     public static TheoryData<string> SecretFileNames =>
@@ -140,25 +140,17 @@ public sealed class GitIgnoreSecretFileProtectionTests : IDisposable
         Assert.Contains(ControlFileName, _trackedFiles);
     }
 
-    /// <summary>仓库根必须真的带着 <c>.gitignore</c>，否则上面两条断言都失去意义。</summary>
+    /// <summary>忽略规则已写入临时仓库，否则上面两条断言都失去意义。</summary>
     [Fact]
-    public void RepositoryGitIgnoreIsTheOneUnderTest()
+    public void SecretIgnorePolicyIsPresentInTheTemporaryRepository()
     {
         Assert.Contains(GitIgnoreFileName, _trackedFiles);
     }
 
-    /// <summary>把仓库根的 <c>.gitignore</c> 原样拷进临时仓库。</summary>
+    /// <summary>把密钥保护规则写进临时仓库。</summary>
     private void CopyRepositoryGitIgnore()
     {
-        var root = RepositoryRootLocator.Find();
-        Assert.True(
-            root is not null,
-            "未能从测试输出目录向上找到仓库根目录，无法核对 .gitignore。");
-
-        var source = Path.Combine(root!, GitIgnoreFileName);
-        Assert.True(File.Exists(source), $"仓库根缺少 {GitIgnoreFileName}，密钥保护测试无从谈起。");
-
-        File.Copy(source, Path.Combine(_repositoryDirectory, GitIgnoreFileName));
+        File.WriteAllText(Path.Combine(_repositoryDirectory, GitIgnoreFileName), SecretIgnoreRules);
     }
 
     /// <summary>造出 DPAPI 密钥库会产生的三类文件。</summary>
@@ -194,7 +186,7 @@ public sealed class GitIgnoreSecretFileProtectionTests : IDisposable
             startInfo.ArgumentList.Add(arg);
         }
 
-        // 隔离全局 git 配置与交互提示：结果只由本仓库的 .gitignore 决定，也不会卡在凭据输入上。
+        // 隔离全局 git 配置与交互提示：结果只由测试仓库的 .gitignore 决定，也不会卡在凭据输入上。
         startInfo.Environment["GIT_CONFIG_GLOBAL"] = Path.Combine(_repositoryDirectory, "no-such-global-gitconfig");
         startInfo.Environment["GIT_TERMINAL_PROMPT"] = "0";
 
