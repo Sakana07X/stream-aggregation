@@ -277,6 +277,9 @@ public sealed class AppCompositionRoot : IDisposable
                 BuildAggregationOptions(),
                 sp.Resolve<IClock>(),
                 sp.Resolve<IMessageStore>()))
+            // 身份校验必须最先执行：缺 group_id / user_id 的消息要在进入去重与闲聊判定前拦下，
+            // 否则空身份消息会污染去重键并在摘要提示词中渲染成空发送者。
+            .AddTransient<IMessageFilter, IdentityFilter>(static _ => new IdentityFilter())
             .AddTransient<IMessageFilter, ChatterFilter>(static _ => new ChatterFilter(new FilteringOptions()))
             .AddTransient<IMessageFilter, DuplicateMessageFilter>(
                 static _ => new DuplicateMessageFilter(TimeSpan.FromMinutes(1)))

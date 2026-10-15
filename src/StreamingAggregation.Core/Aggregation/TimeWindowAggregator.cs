@@ -207,11 +207,13 @@ public sealed class TimeWindowAggregator : IAggregationWindow
         }
 
         // 按时间戳升序重建，保证跨窗口归属正确；顺带兜住未正确应用 since 过滤的存储实现。
+        // 排序键必须与过滤条件同用 ToUtc 归一：裸值排序会在混合 Kind 时按墙钟时刻错排，
+        // 与后面按 UTC 归属窗口的顺序不一致，导致消息落错桶。
         var ordered = messages
             .Where(message => message is not null
                 && string.Equals(message.GroupId, groupId, StringComparison.Ordinal)
                 && ToUtc(message.Timestamp) >= resume)
-            .OrderBy(message => message.Timestamp, Comparer<DateTime>.Default)
+            .OrderBy(message => ToUtc(message.Timestamp), Comparer<DateTime>.Default)
             .ToArray();
 
         var restored = 0;

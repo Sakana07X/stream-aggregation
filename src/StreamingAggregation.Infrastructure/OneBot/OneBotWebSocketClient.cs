@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Net.WebSockets;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using StreamingAggregation.Core.Abstractions;
@@ -555,9 +556,14 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
     }
 
     /// <summary>
-    /// 解析一帧并投递其中的全部群消息；解析失败只丢弃坏数据，不中断接收循环。
+    /// 拆分并解析一帧，投递其中的全部群消息；解析失败只丢弃坏数据，不中断接收循环。
     /// </summary>
-    /// <param name="payload">完整的一帧 UTF-8 JSON，可能包含多个顶层 JSON 值。</param>
+    /// <remarks>
+    /// 职责分工：<see cref="OneBotFrameSplitter"/> 只负责切出顶层 JSON 值，
+    /// <see cref="OneBotEventParser"/> 负责协议解析，<see cref="OneBotMapper"/> 负责领域映射。
+    /// 白名单过滤不在这里做，由 <see cref="GroupWhitelistMatcher"/> 在下游处理。
+    /// </remarks>
+    /// <param name="payload">完整的一帧 UTF-8 JSON，可能包含多个顶层 JSON 值（由 <see cref="OneBotFrameSplitter"/> 拆分）。</param>
     /// <param name="sink">复用的收集列表，每次调用前由本方法清空。</param>
     /// <param name="writer">事件通道写入端。</param>
     private void DispatchFrame(ReadOnlyMemory<byte> payload, List<GroupMessageEvent> sink, ChannelWriter<GroupMessageEvent> writer)
@@ -571,7 +577,19 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
 
         try
         {
-            OneBotEventMapper.MapGroupMessages(payload, sink);
+            // 一帧内可能有多个顶层 JSON 值（粘包），逐个解析并映射。
+            foreach (var value in OneBotFrameSplitter.Split(payload))
+            {
+                var result = OneBotEventParser.ParseDetailed(Encoding.UTF8.GetString(value.Span));
+
+                if (OneBotMapper.TryMapToGroupMessageEvent(result, out var groupMessage))
+                {
+                    sink.Add(groupMessage);
+                    continue;
+                }
+
+                NoteNonGroupMessage(result);
+            }
         }
         catch (JsonException ex)
         {
@@ -583,6 +601,36 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
         {
             // 无界通道不会满，写入必然成功，因此不需要异步等待背压。
             writer.TryWrite(groupMessage);
+        }
+    }
+
+    /// <summary>
+    /// 为非群消息的帧留痕。
+    /// </summary>
+    /// <remarks>
+    /// 内嵌映射器时代只用一个 <see langword="null"/> 表示"不关心"，于是坏数据、心跳、
+    /// 私聊消息在日志里完全无法区分。这里借解析器的分类把它们分开：
+    /// 坏数据记 <see cref="OneBotDiagnosticLevel.Warning"/>（但不中断接收循环），
+    /// meta_event 记 <see cref="OneBotDiagnosticLevel.Debug"/>（心跳是常态，不该刷屏），
+    /// 私聊/通知等格式合法的其它事件保持静默。
+    /// </remarks>
+    /// <param name="result">解析结果；调用方已确认它不是群消息。</param>
+    private void NoteNonGroupMessage(OneBotParseResult result)
+    {
+        switch (result.Kind)
+        {
+            case OneBotEventKind.Ignored:
+                Log(OneBotDiagnosticLevel.Warning, $"事件帧中存在无法解析的内容：{Sanitize(result.Reason)}", null);
+                break;
+
+            case OneBotEventKind.MetaEvent:
+                Log(OneBotDiagnosticLevel.Debug, $"收到 OneBot 元事件：{Sanitize(result.MetaEventType)}。", null);
+                break;
+
+            case OneBotEventKind.Other:
+            case OneBotEventKind.GroupMessage:
+            default:
+                break;
         }
     }
 
@@ -649,330 +697,4 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
     /// <param name="Outcome">会话结束方式。</param>
     /// <param name="Connected">本次会话是否成功完成握手。</param>
     private readonly record struct SessionResult(SessionOutcome Outcome, bool Connected);
-
-    /// <summary>
-    /// OneBot 事件 → <see cref="GroupMessageEvent"/> 的纯映射逻辑。
-    /// </summary>
-    /// <remarks>
-    /// 群消息事件的判定条件为 <c>post_type == "message"</c> 且 <c>message_type == "group"</c>；
-    /// 心跳（meta_event）、通知（notice）、请求（request）、私聊消息一律返回 <see langword="null"/>。
-    /// </remarks>
-    private static class OneBotEventMapper
-    {
-        private const string PostTypeMessage = "message";
-        private const string MessageTypeGroup = "group";
-
-        /// <summary>
-        /// 解析一帧中可能存在的多个顶层 JSON 值，把其中的群消息依次加入 <paramref name="sink"/>。
-        /// </summary>
-        /// <param name="payload">完整的一帧 UTF-8 字节。</param>
-        /// <param name="sink">收集列表；调用前应已清空。</param>
-        /// <exception cref="JsonException">帧中存在非法 JSON（此前已解析出的事件仍保留在 sink 中）。</exception>
-        internal static void MapGroupMessages(ReadOnlyMemory<byte> payload, List<GroupMessageEvent> sink)
-        {
-            var utf8 = payload.Span;
-            var offset = 0;
-
-            while (offset < utf8.Length)
-            {
-                offset = SkipWhitespace(utf8, offset);
-
-                if (offset >= utf8.Length)
-                {
-                    break;
-                }
-
-                if (utf8[offset] != (byte)'{' && utf8[offset] != (byte)'[')
-                {
-                    // 遇到无法识别的字节：跳过并重新同步，避免坏数据连累同一帧内的其它事件。
-                    offset++;
-                    continue;
-                }
-
-                if (!TryFindValueEnd(utf8, offset, out var end))
-                {
-                    throw new JsonException("事件帧末尾存在不完整的 JSON 值。");
-                }
-
-                var groupMessage = TryMapGroupMessage(payload.Slice(offset, end - offset));
-
-                if (groupMessage is not null)
-                {
-                    sink.Add(groupMessage);
-                }
-
-                offset = end;
-            }
-        }
-
-        /// <summary>
-        /// 扫描出一个顶层 JSON 值的结束下标（不含）。
-        /// 正确处理字符串字面量与转义，因此消息正文里的 <c>{</c>、<c>"</c> 不会被误判。
-        /// </summary>
-        private static bool TryFindValueEnd(ReadOnlySpan<byte> utf8, int start, out int end)
-        {
-            var depth = 0;
-            var inString = false;
-            var escaped = false;
-
-            for (var i = start; i < utf8.Length; i++)
-            {
-                var current = utf8[i];
-
-                if (inString)
-                {
-                    if (escaped)
-                    {
-                        escaped = false;
-                    }
-                    else if (current == (byte)'\\')
-                    {
-                        escaped = true;
-                    }
-                    else if (current == (byte)'"')
-                    {
-                        inString = false;
-                    }
-
-                    continue;
-                }
-
-                switch (current)
-                {
-                    case (byte)'"':
-                        inString = true;
-                        break;
-
-                    case (byte)'{':
-                    case (byte)'[':
-                        depth++;
-                        break;
-
-                    case (byte)'}':
-                    case (byte)']':
-                        depth--;
-                        break;
-
-                    default:
-                        break;
-                }
-
-                if (depth <= 0)
-                {
-                    end = i + 1;
-                    return true;
-                }
-            }
-
-            end = utf8.Length;
-            return false;
-        }
-
-        private static int SkipWhitespace(ReadOnlySpan<byte> utf8, int offset)
-        {
-            while (offset < utf8.Length)
-            {
-                var current = utf8[offset];
-
-                if (current is not ((byte)' ' or (byte)'\t' or (byte)'\r' or (byte)'\n'))
-                {
-                    break;
-                }
-
-                offset++;
-            }
-
-            return offset;
-        }
-
-        /// <summary>
-        /// 把一个 JSON 根对象映射为群消息事件。
-        /// </summary>
-        /// <returns>群消息事件；非群消息或关键字段缺失时返回 <see langword="null"/>。</returns>
-        private static GroupMessageEvent? TryMapGroupMessage(ReadOnlyMemory<byte> utf8Json)
-        {
-            using var document = JsonDocument.Parse(utf8Json);
-            var root = document.RootElement;
-
-            if (root.ValueKind != JsonValueKind.Object)
-            {
-                return null;
-            }
-
-            if (!TryGetScalar(root, "post_type", out var postType) || postType != PostTypeMessage)
-            {
-                return null;
-            }
-
-            if (!TryGetScalar(root, "message_type", out var messageType) || messageType != MessageTypeGroup)
-            {
-                return null;
-            }
-
-            if (!TryGetScalar(root, "group_id", out var groupId) || groupId.Length == 0)
-            {
-                return null;
-            }
-
-            if (!TryGetScalar(root, "user_id", out var userId) || userId.Length == 0)
-            {
-                return null;
-            }
-
-            var messageId = TryGetScalar(root, "message_id", out var id) && id.Length > 0
-                ? id
-                : string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{groupId}:{userId}:{TimestampOf(root).Ticks}");
-
-            return new GroupMessageEvent(
-                messageId,
-                groupId,
-                userId,
-                ExtractText(root),
-                TimestampOf(root));
-        }
-
-        /// <summary>
-        /// 提取消息正文：优先解析分段数组，退化时用原始字符串或 <c>raw_message</c>。
-        /// </summary>
-        private static string ExtractText(JsonElement root)
-        {
-            if (root.TryGetProperty("message", out var message))
-            {
-                switch (message.ValueKind)
-                {
-                    case JsonValueKind.String:
-                        return message.GetString() ?? string.Empty;
-
-                    case JsonValueKind.Array:
-                        return BuildFromSegments(message);
-
-                    default:
-                        break;
-                }
-            }
-
-            return TryGetScalar(root, "raw_message", out var raw) ? raw : string.Empty;
-        }
-
-        private static string BuildFromSegments(JsonElement segments)
-        {
-            var builder = new System.Text.StringBuilder();
-
-            foreach (var segment in segments.EnumerateArray())
-            {
-                if (segment.ValueKind != JsonValueKind.Object
-                    || !TryGetScalar(segment, "type", out var type)
-                    || !segment.TryGetProperty("data", out var data)
-                    || data.ValueKind != JsonValueKind.Object)
-                {
-                    continue;
-                }
-
-                switch (type)
-                {
-                    case "text":
-                        AppendData(builder, data, "text", fallback: string.Empty);
-                        break;
-
-                    case "at":
-                        // data.qq 可能是数字，统一按标量读取。
-                        AppendData(builder, data, "qq", fallback: "someone", prefix: "@");
-                        break;
-
-                    case "image":
-                        builder.Append("[图片]");
-                        break;
-
-                    case "face":
-                        builder.Append("[表情]");
-                        break;
-
-                    case "record":
-                        builder.Append("[语音]");
-                        break;
-
-                    case "video":
-                        builder.Append("[视频]");
-                        break;
-
-                    case "reply":
-                        // 引用消息不重复计入正文。
-                        break;
-
-                    default:
-                        break;
-                }
-            }
-
-            return builder.ToString();
-        }
-
-        private static void AppendData(
-            System.Text.StringBuilder builder,
-            JsonElement data,
-            string key,
-            string fallback,
-            string prefix = "")
-        {
-            var value = TryGetScalar(data, key, out var text) && text.Length > 0 ? text : fallback;
-
-            if (value.Length == 0)
-            {
-                return;
-            }
-
-            builder.Append(prefix).Append(value);
-        }
-
-        /// <summary>
-        /// 解析 <c>time</c> 字段（Unix 秒）。缺失或非法时退化为当前本地时间。
-        /// </summary>
-        private static DateTime TimestampOf(JsonElement root)
-        {
-            if (root.TryGetProperty("time", out var time)
-                && time.ValueKind == JsonValueKind.Number
-                && time.TryGetInt64(out var unixSeconds))
-            {
-                try
-                {
-                    return DateTimeOffset.FromUnixTimeSeconds(unixSeconds).LocalDateTime;
-                }
-                catch (ArgumentOutOfRangeException)
-                {
-                    // 时间戳越界时退回本地当前时间。
-                }
-            }
-
-            return DateTime.Now;
-        }
-
-        /// <summary>
-        /// 读取标量字段。OneBot 的 QQ 号既可能是字符串也可能是数字，这里统一成字符串。
-        /// </summary>
-        private static bool TryGetScalar(JsonElement parent, string name, out string value)
-        {
-            value = string.Empty;
-
-            if (!parent.TryGetProperty(name, out var element))
-            {
-                return false;
-            }
-
-            switch (element.ValueKind)
-            {
-                case JsonValueKind.String:
-                    value = element.GetString() ?? string.Empty;
-                    return true;
-
-                case JsonValueKind.Number:
-                case JsonValueKind.True:
-                case JsonValueKind.False:
-                    value = element.GetRawText();
-                    return true;
-
-                default:
-                    return false;
-            }
-        }
-    }
 }
