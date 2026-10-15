@@ -44,6 +44,7 @@ public sealed record OneBotDiagnostic(OneBotDiagnosticLevel Level, string Messag
 ///   <item><description>按 <see cref="WebSocketReceiveResult.EndOfMessage"/> 循环拼包，完整还原一条 JSON 帧后才解析，解决 WebSocket 分包问题。</description></item>
 ///   <item><description>断线后按 <see cref="ReconnectPolicy"/>（指数退避 + 抖动 + 上限）自动重连，<see cref="CancellationToken"/> 全链路贯穿。</description></item>
 ///   <item><description><strong>只读</strong>：仅接收事件，不发送任何 OneBot API 请求，不写 SnowLuma 数据。</description></item>
+///   <item><description>非回环地址强制使用 WSS：明文 <c>ws://</c> 仅允许回环主机，构造远程明文端点时抛 <see cref="ArgumentException"/>。</description></item>
 /// </list>
 /// <para>
 /// 事件流由一条后台循环 + 无界通道驱动；<see cref="StreamAsync"/> 收到的令牌同时管辖该循环，
@@ -85,6 +86,7 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
     /// <param name="diagnostics">可选诊断回调，收到的是已脱敏的消息。</param>
     /// <exception cref="ArgumentNullException"><paramref name="settings"/> 或 <paramref name="accessTokenProvider"/> 为 <see langword="null"/>。</exception>
     /// <exception cref="ArgumentOutOfRangeException">主机为空或端口越界。</exception>
+    /// <exception cref="ArgumentException">明文 WebSocket (<c>ws://</c>) 仅允许回环地址；远程主机必须使用 WSS。</exception>
     public OneBotWebSocketClient(
         OneBotConnectionSettings settings,
         Func<string?> accessTokenProvider,
@@ -252,6 +254,14 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
         if (port is < 1 or > 65535)
         {
             throw new ArgumentOutOfRangeException(nameof(port), port, "OneBot 端口必须位于 1-65535 之间。");
+        }
+
+        // 非回环地址强制使用 WSS：明文 WS 只允许回环端点，远程主机必须 TLS。
+        if (!useSsl && !EndpointTransportPolicy.IsLoopback(host))
+        {
+            throw new ArgumentException(
+                "OneBot 端点使用明文 WebSocket (ws://) 时主机必须是回环地址；远程主机请使用 WSS (wss://)。",
+                nameof(host));
         }
 
         // UriBuilder 归一化默认端口：ws 默认 80、wss 默认 443，显式端口一律保留。

@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 using StreamingAggregation.Core;
 using StreamingAggregation.Core.Abstractions;
 using StreamingAggregation.Infrastructure.Persistence;
+using StreamingAggregation.Tests.Fixtures;
 
 namespace StreamingAggregation.Tests.Composition;
 
@@ -29,9 +30,6 @@ namespace StreamingAggregation.Tests.Composition;
 /// </remarks>
 public sealed class CoreInterfaceCoverageTests
 {
-    /// <summary>仓库根目录的标志文件。</summary>
-    private const string SolutionFileName = "StreamingAggregation.slnx";
-
     /// <summary>参与"找实现"的程序集：Core 自身与 Infrastructure。</summary>
     private static readonly Assembly[] ProviderAssemblies =
     [
@@ -139,10 +137,10 @@ public sealed class CoreInterfaceCoverageTests
     /// <param name="sourceRelativePath">实现源文件相对仓库根的路径。</param>
     private static void AssertAppLayerProvider(Type service, string implementation, string sourceRelativePath)
     {
-        var root = FindRepositoryRoot();
+        var root = RepositoryRootLocator.Find();
         Assert.True(
             root is not null,
-            $"未能从测试输出目录向上找到 {SolutionFileName}，无法核对 App 层实现。");
+            $"未能从测试输出目录向上找到仓库根目录，无法核对 App 层实现。");
 
         var sourcePath = Path.Combine(root!, sourceRelativePath.Replace('/', Path.DirectorySeparatorChar));
         Assert.True(File.Exists(sourcePath), $"App 层实现源文件不存在：{sourceRelativePath}");
@@ -160,24 +158,5 @@ public sealed class CoreInterfaceCoverageTests
             $"{sourceRelativePath} 未声明“{typeName} : {service.Name}”，接口 {service.FullName} 实际没有实现。");
     }
 
-    /// <summary>
-    /// 从测试输出目录向上查找仓库根目录。
-    /// </summary>
-    /// <returns>仓库根目录；找不到时返回 <see langword="null"/>。</returns>
-    private static string? FindRepositoryRoot()
-    {
-        var directory = new DirectoryInfo(AppContext.BaseDirectory);
 
-        while (directory is not null)
-        {
-            if (File.Exists(Path.Combine(directory.FullName, SolutionFileName)))
-            {
-                return directory.FullName;
-            }
-
-            directory = directory.Parent;
-        }
-
-        return null;
-    }
 }

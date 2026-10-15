@@ -18,6 +18,7 @@ attachments/
 # DPAPI 密文虽然已加密，但仍是本机凭据副本，不应随仓库分发
 secrets/
 secrets.dat
+secrets.dat.*
 *.dat
 *.pfx
 *.p12

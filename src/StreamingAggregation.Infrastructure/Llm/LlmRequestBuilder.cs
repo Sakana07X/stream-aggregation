@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using StreamingAggregation.Core;
+using StreamingAggregation.Core.Configuration;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Infrastructure.Llm;
@@ -70,7 +71,7 @@ public static class LlmRequestBuilder
     /// 把配置里的端点拼成 <c>{Endpoint}/chat/completions</c>。
     /// </summary>
     /// <param name="endpoint">服务基址，例如 <c>https://api.openai.com/v1</c>。</param>
-    /// <exception cref="ArgumentException">端点为空、不是绝对 URI 或协议不是 http(s)。</exception>
+    /// <exception cref="ArgumentException">端点为空、不是绝对 URI、协议不是 http(s)，或非回环地址使用了明文 HTTP。</exception>
     public static Uri BuildChatCompletionsUri(string endpoint)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(endpoint);
@@ -84,6 +85,16 @@ public static class LlmRequestBuilder
         if (baseUri.Scheme != Uri.UriSchemeHttp && baseUri.Scheme != Uri.UriSchemeHttps)
         {
             throw new ArgumentException($"模型端点协议必须是 http 或 https，当前为 '{baseUri.Scheme}'。", nameof(endpoint));
+        }
+
+        // 非回环地址强制 HTTPS：明文 HTTP 在局域网内可能被嗅探，API Key 会泄露。
+        // 回环地址（localhost、127.0.0.0/8、::1）允许 HTTP，方便本地推理服务开发调试。
+        if (baseUri.Scheme == Uri.UriSchemeHttp && !EndpointTransportPolicy.IsLoopback(baseUri.Host))
+        {
+            throw new ArgumentException(
+                $"模型端点 '{trimmed}' 使用明文 HTTP 且目标不是回环地址，存在凭据泄露风险。" +
+                "请改用 HTTPS，或将端点指向 localhost / 127.0.0.1 等回环地址。",
+                nameof(endpoint));
         }
 
         var builder = new UriBuilder(baseUri)

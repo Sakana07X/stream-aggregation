@@ -17,6 +17,10 @@ namespace StreamingAggregation.Infrastructure.Llm;
 /// <para><b>凭据</b>：API Key 只从 <see cref="ISecretStore"/>（DPAPI 实现）读取，
 /// 键名默认 <see cref="DefaultApiKeySecretKey"/>，<b>不</b>使用 <see cref="ModelSettings.ApiKey"/>——
 /// 即使传进来的设置对象带着明文 Key，本客户端也会忽略它。</para>
+/// <para><b>端点传输安全</b>：非回环地址的模型端点必须使用 HTTPS；
+/// 明文 HTTP 仅在目标是 localhost / 127.0.0.0/8 / ::1 等回环地址时允许。
+/// 违反此策略的端点会在 <see cref="Prepare"/> 阶段被归一为
+/// <see cref="LlmFailureKind.ConfigurationInvalid"/> 失败结果。</para>
 /// <para><b>失败处理</b>：超时、网络失败、HTTP 非 2xx、响应非 JSON、模型输出无法解析、
 /// 配置缺失，全部归一成 <see cref="LlmResult"/> 里 <c>IsSuccess = false</c> 的结果；
 /// 只有调用方主动取消才抛 <see cref="OperationCanceledException"/>。</para>

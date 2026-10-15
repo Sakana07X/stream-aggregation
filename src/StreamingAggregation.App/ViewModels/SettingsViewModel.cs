@@ -345,7 +345,40 @@ public sealed class SettingsViewModel : ObservableObject
             errors.Add($"保留天数必须至少 {MinRetentionDays} 天。");
         }
 
+        // 传输策略：非回环（远程）连接必须走 TLS。
+        // EndpointTransportPolicy 失败即收紧：无法确认回环时按远程处理。
+        if (!EndpointTransportPolicy.IsLoopback(Host) && !UseSsl)
+        {
+            errors.Add("远程连接必须使用 WSS。");
+        }
+
+        var endpoint = Endpoint ?? string.Empty;
+        if (endpoint.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            && !EndpointTransportPolicy.IsLoopback(EndpointHost(endpoint)))
+        {
+            errors.Add("远程端点必须使用 HTTPS。");
+        }
+
         return errors;
+    }
+
+    /// <summary>
+    /// 从模型端点地址中取出主机名，供 <see cref="EndpointTransportPolicy"/> 判定回环。
+    /// </summary>
+    /// <remarks>
+    /// 端点无法解析为绝对 URI 时返回原串——传输策略对无法解析的输入按远程处理，
+    /// 与安全收紧语义保持一致。
+    /// </remarks>
+    /// <param name="endpoint">模型端点地址。</param>
+    /// <returns>主机名；无法解析时为原串。</returns>
+    private static string EndpointHost(string endpoint)
+    {
+        if (Uri.TryCreate(endpoint, UriKind.Absolute, out var uri))
+        {
+            return uri.Host;
+        }
+
+        return endpoint;
     }
 
     /// <summary>
