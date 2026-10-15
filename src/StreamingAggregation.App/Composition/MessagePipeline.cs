@@ -1,25 +1,16 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
-using StreamingAggregation.Core;
 using StreamingAggregation.Core.Abstractions;
 using StreamingAggregation.Core.Aggregation;
 using StreamingAggregation.Core.Filtering;
 using StreamingAggregation.Core.Models;
+using StreamingAggregation.Infrastructure;
+using StreamingAggregation.Infrastructure.Aggregation;
 using StreamingAggregation.Infrastructure.OneBot;
 
 namespace StreamingAggregation.App.Composition;
-
-/// <summary>管线日志级别。</summary>
-internal enum PipelineLogLevel
-{
-    Debug,
-    Info,
-    Warning,
-    Error,
-}
 
 /// <summary>
 /// 消息管线：把 OneBot 事件流转成"消息落库 → 进聚合窗口 → 到点摘要 → 待办入库 → 紧急通知"。
@@ -33,6 +24,11 @@ internal enum PipelineLogLevel
 /// <para>
 /// <b>失败隔离</b>：单条消息处理失败只丢这一条并记账，整条管线不因此中断——后台聚合是
 /// 锦上添花功能，不能因为一条脏消息或一次模型超时把消息接收一起带崩。
+/// </para>
+/// <para>
+/// <b>批次处理已外移</b>：单批次的「调模型 → 落行动项 → 落摘要 → 标记完成」编排放在
+/// Infrastructure 的 <see cref="BatchProcessor"/>，那里的类型不依赖 WinUI，测试项目才能加载并断言。
+/// 本类只负责"什么时候该处理哪个批次"，不重复实现编排。
 /// </para>
 /// <para>
 /// 管线自身不创建 <see cref="IDisposable"/> 资源（连接、<see cref="IDisposable"/> 服务都由
@@ -49,12 +45,8 @@ internal sealed class MessagePipeline
 
     private readonly IOneBotEventSource _source;
     private readonly IMessageStore _messageStore;
-    private readonly IBatchStore _batchStore;
-    private readonly IDigestStore _digestStore;
-    private readonly ITaskStore _taskStore;
+    private readonly BatchProcessor _batchProcessor;
     private readonly IAggregationWindow _window;
-    private readonly ISummarizationClient _summarizer;
-    private readonly INotificationService _notifications;
     private readonly Func<GroupWhitelistMatcher> _matcherFactory;
     private readonly IReadOnlyList<IMessageFilter> _filters;
     private readonly Func<bool> _isPaused;
@@ -66,12 +58,8 @@ internal sealed class MessagePipeline
     /// </summary>
     /// <param name="source">OneBot 事件源（独占订阅）。</param>
     /// <param name="messageStore">消息存储。</param>
-    /// <param name="batchStore">批次存储。</param>
-    /// <param name="digestStore">摘要存储。</param>
-    /// <param name="taskStore">行动项（待办）存储。</param>
+    /// <param name="batchProcessor">批次处理器；单批次的摘要、落库与通知由它负责。</param>
     /// <param name="window">聚合窗口。</param>
-    /// <param name="summarizer">摘要客户端。</param>
-    /// <param name="notifications">通知通道。</param>
     /// <param name="matcherFactory">按当前设置生成群白名单匹配器的委托。</param>
     /// <param name="filters">按顺序执行的过滤器。</param>
     /// <param name="isPaused">是否处于暂停状态的判定委托。</param>
@@ -80,12 +68,8 @@ internal sealed class MessagePipeline
     public MessagePipeline(
         IOneBotEventSource source,
         IMessageStore messageStore,
-        IBatchStore batchStore,
-        IDigestStore digestStore,
-        ITaskStore taskStore,
+        BatchProcessor batchProcessor,
         IAggregationWindow window,
-        ISummarizationClient summarizer,
-        INotificationService notifications,
         Func<GroupWhitelistMatcher> matcherFactory,
         IReadOnlyList<IMessageFilter> filters,
         Func<bool> isPaused,
@@ -94,12 +78,8 @@ internal sealed class MessagePipeline
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _messageStore = messageStore ?? throw new ArgumentNullException(nameof(messageStore));
-        _batchStore = batchStore ?? throw new ArgumentNullException(nameof(batchStore));
-        _digestStore = digestStore ?? throw new ArgumentNullException(nameof(digestStore));
-        _taskStore = taskStore ?? throw new ArgumentNullException(nameof(taskStore));
+        _batchProcessor = batchProcessor ?? throw new ArgumentNullException(nameof(batchProcessor));
         _window = window ?? throw new ArgumentNullException(nameof(window));
-        _summarizer = summarizer ?? throw new ArgumentNullException(nameof(summarizer));
-        _notifications = notifications ?? throw new ArgumentNullException(nameof(notifications));
         _matcherFactory = matcherFactory ?? throw new ArgumentNullException(nameof(matcherFactory));
         _filters = filters ?? throw new ArgumentNullException(nameof(filters));
         _isPaused = isPaused ?? throw new ArgumentNullException(nameof(isPaused));
@@ -210,7 +190,7 @@ internal sealed class MessagePipeline
         }
     }
 
-    /// <summary>取一次到期批次并逐个摘要、落库、按需通知。</summary>
+    /// <summary>取一次到期批次并逐个交给 <see cref="BatchProcessor"/> 处理。</summary>
     /// <param name="cancellationToken">取消令牌。</param>
     private async Task FlushOnceAsync(CancellationToken cancellationToken)
     {
@@ -222,7 +202,7 @@ internal sealed class MessagePipeline
 
             try
             {
-                await SummarizeAsync(batch, cancellationToken).ConfigureAwait(false);
+                await _batchProcessor.ProcessAsync(batch, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -230,130 +210,13 @@ internal sealed class MessagePipeline
             }
             catch (Exception ex)
             {
+                // BatchProcessor 已就地吸收单批次失败并标 Failed；能冒到这里的是它自己都没兜住的
+                // 意外（例如标 Failed 时写库也失败），继续处理同批的下一个批次。
                 _log(
                     PipelineLogLevel.Error,
                     $"批次 {batch.Id}（群 {batch.GroupId}）处理失败：{ex.Message}");
             }
         }
-    }
-
-    /// <summary>摘要单个批次：标记处理中 → 调模型 → 落库（摘要 + 行动项）→ 按分类通知。</summary>
-    /// <param name="batch">到期批次。</param>
-    /// <param name="cancellationToken">取消令牌。</param>
-    private async Task SummarizeAsync(AggregationBatch batch, CancellationToken cancellationToken)
-    {
-        await _batchStore
-            .SaveAsync(batch with { Status = BatchStatus.Processing }, cancellationToken)
-            .ConfigureAwait(false);
-
-        var result = await _summarizer.SummarizeAsync(batch, cancellationToken).ConfigureAwait(false);
-
-        if (!result.IsSuccess || result.Digest is not { } digest)
-        {
-            await _batchStore
-                .SaveAsync(batch with { Status = BatchStatus.Failed }, cancellationToken)
-                .ConfigureAwait(false);
-
-            _log(
-                PipelineLogLevel.Warning,
-                string.Format(
-                    CultureInfo.CurrentCulture,
-                    "批次 {0}（群 {1}）摘要失败：{2}",
-                    batch.Id,
-                    batch.GroupId,
-                    SummarizeFailure(result.RawResponse)));
-
-            return;
-        }
-
-        await _digestStore.SaveAsync(digest, cancellationToken).ConfigureAwait(false);
-        await PersistActionItemsAsync(result.ActionItems, batch, cancellationToken).ConfigureAwait(false);
-        await _batchStore
-            .SaveAsync(batch with { Status = BatchStatus.Completed }, cancellationToken)
-            .ConfigureAwait(false);
-
-        NotifyIfUrgent(digest);
-    }
-
-    /// <summary>把本轮摘要产出的行动项逐个落库，单个失败只丢这一条。</summary>
-    /// <remarks>
-    /// <para>
-    /// 待办是摘要之外的独立产出，写不进去不该把已经成功的摘要判成失败——因此每个行动项各自
-    /// 兜一层 <c>try/catch</c>，失败只记日志。整段唯一会向外抛的是取消：管线正在停，
-    /// 继续写库没有意义。
-    /// </para>
-    /// <para>
-    /// 行动项 ID 按批次确定性生成（见 <c>LlmResultMapper</c>），同一批次重跑会命中同一行，
-    /// 所以落库前必须保留用户状态，详见 <see cref="PreserveUserStatusAsync"/>。
-    /// </para>
-    /// </remarks>
-    /// <param name="actionItems">本轮产出的行动项，可为空。</param>
-    /// <param name="batch">行动项所属批次，用于日志定位。</param>
-    /// <param name="cancellationToken">取消令牌。</param>
-    private async Task PersistActionItemsAsync(
-        IReadOnlyList<ActionItem> actionItems,
-        AggregationBatch batch,
-        CancellationToken cancellationToken)
-    {
-        foreach (var actionItem in actionItems)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            try
-            {
-                var item = await PreserveUserStatusAsync(actionItem, cancellationToken).ConfigureAwait(false);
-                await _taskStore.SaveAsync(item, cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _log(
-                    PipelineLogLevel.Warning,
-                    string.Format(
-                        CultureInfo.CurrentCulture,
-                        "批次 {0}（群 {1}）的行动项 {2} 落库失败：{3}",
-                        batch.Id,
-                        batch.GroupId,
-                        actionItem.Id,
-                        ex.Message));
-            }
-        }
-    }
-
-    /// <summary>
-    /// 沿用库里已有的「完成 / 忽略」状态，再交给 <see cref="ITaskStore.SaveAsync"/> 全量覆盖。
-    /// </summary>
-    /// <remarks>
-    /// <c>SaveAsync</c> 是全量 UPSERT，<c>completed</c> / <c>ignored</c> 两列也会被覆盖，
-    /// 而模型每次都会重新产出默认状态的全量行动项。同一批次重跑若不先把用户状态捞回来，
-    /// 用户已经勾掉的待办会重新冒回待办列表——这是静默丢用户操作，不能接受。
-    /// 代价只是每个行动项一次主键查询，相对刚发生的模型调用可以忽略。
-    /// </remarks>
-    /// <param name="actionItem">本轮产出的行动项。</param>
-    /// <param name="cancellationToken">取消令牌。</param>
-    /// <returns>带上库内既有用户状态的行动项；库里还没有该 ID 时原样返回。</returns>
-    private async Task<ActionItem> PreserveUserStatusAsync(ActionItem actionItem, CancellationToken cancellationToken)
-    {
-        var existing = await _taskStore.GetByIdAsync(actionItem.Id, cancellationToken).ConfigureAwait(false);
-
-        return existing is null
-            ? actionItem
-            : actionItem with { Completed = existing.Completed, Ignored = existing.Ignored };
-    }
-
-    /// <summary>摘要分类为紧急时发一条高优先级通知。</summary>
-    /// <param name="digest">摘要。</param>
-    private void NotifyIfUrgent(Digest digest)
-    {
-        if (digest.Category != DigestCategory.Urgent)
-        {
-            return;
-        }
-
-        _notifications.NotifyUrgent(digest.Summary, digest.Reason);
     }
 
     /// <summary>逐个跑过滤器，全部放行才算接受。</summary>
@@ -401,24 +264,5 @@ internal sealed class MessagePipeline
         }
 
         return half > MaximumFlushInterval ? MaximumFlushInterval : half;
-    }
-
-    /// <summary>把模型侧的失败描述压成一行，避免整段响应刷屏。</summary>
-    /// <param name="rawResponse">模型原始响应或错误描述。</param>
-    /// <returns>截断后的描述。</returns>
-    private static string SummarizeFailure(string? rawResponse)
-    {
-        const int MaxLength = 200;
-
-        if (string.IsNullOrWhiteSpace(rawResponse))
-        {
-            return "模型未返回可用结果。";
-        }
-
-        var collapsed = string.Join(' ', rawResponse.Split(
-            ['\r', '\n'],
-            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-
-        return collapsed.Length <= MaxLength ? collapsed : string.Concat(collapsed.AsSpan(0, MaxLength), "…");
     }
 }

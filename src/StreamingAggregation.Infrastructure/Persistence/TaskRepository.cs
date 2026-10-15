@@ -10,7 +10,8 @@ namespace StreamingAggregation.Infrastructure.Persistence;
 /// </summary>
 /// <remarks>
 /// <para>
-/// 写入路径刻意分成两类：<see cref="SaveAsync"/> 是全量 UPSERT，用于刷新描述、截止时间等业务字段；
+/// 写入路径刻意分成两类：<see cref="SaveAsync"/> 是后台刷新语义的 UPSERT，只更新业务字段
+/// （action/deadline/importance/reason/source_group_id/updated_at），<b>不碰用户状态列</b>；
 /// <see cref="SetCompletedAsync"/> / <see cref="SetIgnoredAsync"/> 是只碰状态列的窄 UPDATE。
 /// 两者不可合并——对同一批次重新摘要时，模型会重新产出全量行动项并走 <see cref="SaveAsync"/>，
 /// 若那时连状态列一起覆盖，用户已经勾掉的「完成」与「忽略」会被冲回默认值。
@@ -20,6 +21,10 @@ namespace StreamingAggregation.Infrastructure.Persistence;
 /// 与 <c>DigestRepository</c> 对 <c>digests.category</c> 的处理保持一致。数据库可能被外部改坏，
 /// 因此读取时校验枚举合法性，非法值降级为 <see cref="Importance.Medium"/> 而不是抛异常：
 /// 坏掉的行不应该让整个待办列表读不出来，降级到中优先级也避免它被顶到列表最前面。
+/// </para>
+/// <para>
+/// 批量写入只提供 <see cref="SaveAllAsync"/>（单事务全批），不提供"逐条写、失败忽略"的变体：
+/// 调用方拿到的"部分成功"没法与摘要结果对齐，只会变成静默的数据丢失。
 /// </para>
 /// </remarks>
 public sealed class TaskRepository : ITaskStore
@@ -43,8 +48,6 @@ public sealed class TaskRepository : ITaskStore
             importance      = excluded.importance,
             reason          = excluded.reason,
             source_group_id = excluded.source_group_id,
-            completed       = excluded.completed,
-            ignored         = excluded.ignored,
             updated_at      = excluded.updated_at;
         """;
 
@@ -81,34 +84,83 @@ public sealed class TaskRepository : ITaskStore
     /// 插入或更新行动项（同一 <see cref="ActionItem.Id"/> 重复保存会覆盖旧值）。
     /// </summary>
     /// <remarks>
-    /// 注意这是全量覆盖，包含 <c>completed</c> / <c>ignored</c>；用户改状态请走
-    /// <see cref="SetCompletedAsync"/> / <see cref="SetIgnoredAsync"/>。<c>created_at</c> 在
-    /// 冲突分支里不参与更新，保持首次入库的时间。
+    /// 这是「后台刷新」语义：更新业务字段（action/deadline/importance/reason/source_group_id/updated_at），
+    /// <b>不修改用户状态列</b>（completed/ignored）。冲突时保持数据库原值，
+    /// 需要修改状态必须走 <see cref="SetCompletedAsync"/> / <see cref="SetIgnoredAsync"/>。
+    /// <c>created_at</c> 在冲突分支里不参与更新，保持首次入库的时间。
     /// </remarks>
     public async Task SaveAsync(ActionItem item, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(item);
-        ArgumentException.ThrowIfNullOrWhiteSpace(item.Id, nameof(item.Id));
-        ArgumentException.ThrowIfNullOrWhiteSpace(item.Action, nameof(item.Action));
+        Validate(item);
 
         var now = SqliteTime.ToStorage(_clock.Now);
 
         await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = UpsertSql;
-        command
-            .Bind("$id", item.Id)
-            .Bind("$action", item.Action)
-            .Bind("$deadline", ToStorage(item.Deadline))
-            .Bind("$importance", (int)item.Importance)
-            .Bind("$reason", item.Reason ?? string.Empty)
-            .Bind("$source_group_id", item.SourceGroupId)
-            .Bind("$completed", ToStorage(item.Completed))
-            .Bind("$ignored", ToStorage(item.Ignored))
-            .Bind("$created_at", now)
-            .Bind("$updated_at", now);
+        BindUpsert(command, item, now);
 
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 整批保存行动项：全部条目在<b>同一个事务</b>里写入，任一条失败整批回滚。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>BEGIN IMMEDIATE</c>（<c>deferred: false</c>）在事务一开始就拿写锁，省掉延迟事务从读锁
+    /// 升级到写锁时可能撞上的 <c>SQLITE_BUSY</c>；整批只有几十条，写锁持有时间可以接受。
+    /// </para>
+    /// <para>
+    /// 回滚显式执行，不依赖 <c>await using</c> 析构时的隐式行为——那个行为在不同
+    /// Microsoft.Data.Sqlite 版本里并不一致，靠它兜底等于把"没写进去"的风险留给运气。
+    /// 回滚本身失败（连接已断、事务已结束）时吞掉，让原始异常冒出去：那才是真正的诊断线索。
+    /// </para>
+    /// </remarks>
+    public async Task SaveAllAsync(
+        IReadOnlyList<ActionItem> items,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+
+        if (items.Count == 0)
+        {
+            return;
+        }
+
+        // 先在事务外逐条校验：参数错误不该先占着写锁再回滚，而且此时还没开始写，
+        // 失败语义最干净。
+        foreach (var item in items)
+        {
+            ArgumentNullException.ThrowIfNull(item);
+            Validate(item);
+        }
+
+        var now = SqliteTime.ToStorage(_clock.Now);
+
+        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+
+        try
+        {
+            foreach (var item in items)
+            {
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = UpsertSql;
+                BindUpsert(command, item, now);
+
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            await TryRollbackAsync(transaction).ConfigureAwait(false);
+            throw;
+        }
     }
 
     /// <inheritdoc />
@@ -191,6 +243,44 @@ public sealed class TaskRepository : ITaskStore
         command.Bind("$id", id);
 
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>单条与整批两条写入路径共用的参数绑定，保证语义不会漂移。</summary>
+    private static void BindUpsert(SqliteCommand command, ActionItem item, string now) =>
+        command
+            .Bind("$id", item.Id)
+            .Bind("$action", item.Action)
+            .Bind("$deadline", ToStorage(item.Deadline))
+            .Bind("$importance", (int)item.Importance)
+            .Bind("$reason", item.Reason ?? string.Empty)
+            .Bind("$source_group_id", item.SourceGroupId)
+            .Bind("$completed", ToStorage(item.Completed))
+            .Bind("$ignored", ToStorage(item.Ignored))
+            .Bind("$created_at", now)
+            .Bind("$updated_at", now);
+
+    /// <summary>
+    /// 回滚尽力而为：事务可能已经提交、也可能连接已经断了，此时回滚本身会抛异常，
+    /// 那时应当让调用方看到原始的写入失败，而不是清理阶段的次生异常。
+    /// </summary>
+    private static async Task TryRollbackAsync(SqliteTransaction transaction)
+    {
+        try
+        {
+            // 不能用调用方的令牌：这里正是令牌已取消时最需要回滚的场合。
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // 连接已断或事务已结束：没有可回滚的内容，交给上面的原始异常。
+        }
+    }
+
+    /// <summary>写入前的必填字段校验，单条与整批路径共用。</summary>
+    private static void Validate(ActionItem item)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(item.Id, nameof(item.Id));
+        ArgumentException.ThrowIfNullOrWhiteSpace(item.Action, nameof(item.Action));
     }
 
     /// <summary>

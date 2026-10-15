@@ -1,5 +1,7 @@
 using Microsoft.Data.Sqlite;
+using StreamingAggregation.Core.Abstractions;
 using StreamingAggregation.Infrastructure.Persistence;
+using StreamingAggregation.Tests.Fakes;
 using StreamingAggregation.Tests.Fixtures;
 
 namespace StreamingAggregation.Tests.Persistence;
@@ -42,6 +44,11 @@ internal sealed class SqliteTestDatabase : IDisposable
     public MessageRepository CreateMessageRepository() => new(Connections);
 
     /// <summary>
+    /// 创建 TaskRepository，可选注入假时钟以控制 <c>updated_at</c> 等时间字段。
+    /// </summary>
+    public TaskRepository CreateTaskRepository(IClock? clock = null) => new(Connections, clock);
+
+    /// <summary>
     /// 用一条直连批量写入若干条摘要/消息。
     /// </summary>
     /// <remarks>
@@ -72,6 +79,22 @@ internal sealed class SqliteTestDatabase : IDisposable
         }
 
         await transaction.CommitAsync();
+    }
+
+    /// <summary>
+    /// 直连执行一条 DDL/DML，用来在测试库里造故障注入设施（例如让某一行写入必定失败的触发器）。
+    /// </summary>
+    /// <remarks>
+    /// 仓储的公共 API 不提供"故意写失败"的入口，而"整批回滚"这类保证只能靠一条真的失败的写入来证明。
+    /// </remarks>
+    /// <param name="sql">要执行的语句，由测试代码写死，不是外部输入。</param>
+    public async Task ExecuteAsync(string sql)
+    {
+        await using SqliteConnection connection = await Connections.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = sql;
+
+        await command.ExecuteNonQueryAsync();
     }
 
     public void Dispose()

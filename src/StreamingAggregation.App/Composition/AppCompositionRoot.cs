@@ -14,6 +14,8 @@ using StreamingAggregation.Core.Abstractions;
 using StreamingAggregation.Core.Aggregation;
 using StreamingAggregation.Core.Configuration;
 using StreamingAggregation.Core.Filtering;
+using StreamingAggregation.Infrastructure;
+using StreamingAggregation.Infrastructure.Aggregation;
 using StreamingAggregation.Infrastructure.Llm;
 using StreamingAggregation.Infrastructure.OneBot;
 using StreamingAggregation.Infrastructure.Persistence;
@@ -373,15 +375,21 @@ public sealed class AppCompositionRoot : IDisposable
     {
         IMessageFilter[] filters = [.. _services.ResolveAll<IMessageFilter>().Cast<IMessageFilter>()];
 
-        return new MessagePipeline(
-            source,
-            _services.Resolve<IMessageStore>(),
+        // 单批次的「调模型 → 落行动项 → 落摘要 → 标记完成」在 Infrastructure 的 BatchProcessor 里，
+        // 与 UI 无关，测试项目可直接加载验证；管线只负责决定什么时候处理哪个批次。
+        var batchProcessor = new BatchProcessor(
             _services.Resolve<IBatchStore>(),
             _services.Resolve<IDigestStore>(),
             _services.Resolve<ITaskStore>(),
-            _services.Resolve<IAggregationWindow>(),
             _services.Resolve<ISummarizationClient>(),
             _services.Resolve<INotificationService>(),
+            Log);
+
+        return new MessagePipeline(
+            source,
+            _services.Resolve<IMessageStore>(),
+            batchProcessor,
+            _services.Resolve<IAggregationWindow>(),
             CreateWhitelistMatcher,
             filters,
             () => PauseResume.IsPaused,
@@ -399,7 +407,7 @@ public sealed class AppCompositionRoot : IDisposable
             _settings.OneBotConnection,
             () => secretStore.GetSecret(SettingsStore.OneBotTokenSecretKey),
             ReconnectPolicy.Default,
-            diagnostics: static diagnostic => Log(PipelineLogLevel.Debug, diagnostic.Message));
+            diagnostics: static diagnostic => Log(MapDiagnosticLevel(diagnostic.Level), diagnostic.Message));
     }
 
     /// <summary>按当前设置生成群白名单匹配器。</summary>
@@ -633,4 +641,24 @@ public sealed class AppCompositionRoot : IDisposable
     /// <param name="message">消息。</param>
     private static void Log(PipelineLogLevel level, string message) =>
         Trace.WriteLine($"[{level}] {message}");
+
+    /// <summary>
+    /// 把 OneBot 诊断级别映射到管线日志级别。
+    /// </summary>
+    /// <remarks>
+    /// 不能一律按 <see cref="PipelineLogLevel.Debug"/> 落地：那样握手失败、坏帧、
+    /// 重试耗尽这些 Warning/Error 会被降级成噪声，真正需要排查的信息反而看不见。
+    /// 未预见的枚举值按 <see cref="PipelineLogLevel.Info"/> 兜底——新级别第一次出现时
+    /// 仍然可见，等同于「值得记一笔」。
+    /// </remarks>
+    /// <param name="level">OneBot 诊断级别。</param>
+    /// <returns>对应的管线日志级别。</returns>
+    private static PipelineLogLevel MapDiagnosticLevel(OneBotDiagnosticLevel level) => level switch
+    {
+        OneBotDiagnosticLevel.Debug => PipelineLogLevel.Debug,
+        OneBotDiagnosticLevel.Info => PipelineLogLevel.Info,
+        OneBotDiagnosticLevel.Warning => PipelineLogLevel.Warning,
+        OneBotDiagnosticLevel.Error => PipelineLogLevel.Error,
+        _ => PipelineLogLevel.Info,
+    };
 }
