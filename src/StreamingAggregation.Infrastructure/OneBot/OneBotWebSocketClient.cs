@@ -42,6 +42,7 @@ public sealed record OneBotDiagnostic(OneBotDiagnosticLevel Level, string Messag
 /// <list type="number">
 ///   <item><description>使用 <see cref="ClientWebSocket"/> 连接 <c>ws://127.0.0.1:3001/</c>（或 wss），握手头携带 <c>Authorization: Bearer &lt;token&gt;</c>。</description></item>
 ///   <item><description>访问令牌通过委托在<strong>每次重连时</strong>重新获取，因此令牌轮换自动生效；令牌只出现在握手头中，绝不写入日志或 <see cref="ToString"/>。</description></item>
+///   <item><description>令牌委托返回 <see langword="null"/> 或空串是<strong>合法状态</strong>（本地 SnowLuma 可不配 access token），照常匿名连接；委托<strong>抛异常</strong>则 fail-closed：抛 <see cref="OneBotAccessTokenException"/> 并中止本次连接，绝不退化为匿名连接。</description></item>
 ///   <item><description>按 <see cref="WebSocketReceiveResult.EndOfMessage"/> 循环拼包，完整还原一条 JSON 帧后才解析，解决 WebSocket 分包问题。</description></item>
 ///   <item><description>断线后按 <see cref="ReconnectPolicy"/>（指数退避 + 抖动 + 上限）自动重连，<see cref="CancellationToken"/> 全链路贯穿。</description></item>
 ///   <item><description><strong>只读</strong>：仅接收事件，不发送任何 OneBot API 请求，不写 SnowLuma 数据。</description></item>
@@ -54,9 +55,6 @@ public sealed record OneBotDiagnostic(OneBotDiagnosticLevel Level, string Messag
 /// </remarks>
 public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAsyncDisposable
 {
-    /// <summary>访问令牌在 <see cref="ISecretStore"/> 中的默认键名。</summary>
-    public const string DefaultSecretKey = "onebot.access_token";
-
     private const int ReceiveChunkSize = 8 * 1024;
     private const int DefaultMaxMessageBytes = 4 * 1024 * 1024;
     private const int KeepAliveIntervalSeconds = 30;
@@ -80,7 +78,8 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
     /// <param name="settings">连接配置（主机、端口、是否 TLS）。令牌不从这里读取。</param>
     /// <param name="accessTokenProvider">
     /// 访问令牌提供委托，返回 <see langword="null"/> 或空串表示不带 <c>Authorization</c> 头。
-    /// 每次连接尝试都会调用一次。
+    /// 每次连接尝试都会调用一次。委托抛异常时按 fail-closed 处理：
+    /// 抛 <see cref="OneBotAccessTokenException"/> 中止本次连接，而不是匿名重连。
     /// </param>
     /// <param name="reconnectPolicy">重连退避策略，默认 <see cref="ReconnectPolicy.Default"/>。</param>
     /// <param name="maxMessageBytes">单帧最大字节数，超出视为协议异常，默认 4 MiB。</param>
@@ -107,31 +106,6 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
         Diagnostics = diagnostics;
 
         Diagnostics?.Invoke(new OneBotDiagnostic(OneBotDiagnosticLevel.Info, $"OneBot 事件源已创建，端点 {_endpoint}。"));
-    }
-
-    /// <summary>
-    /// 使用密钥存储（T8 的 DPAPI 实现）提供访问令牌创建客户端。
-    /// </summary>
-    /// <param name="settings">连接配置。</param>
-    /// <param name="secretStore">密钥存储。</param>
-    /// <param name="secretKey">令牌键名，默认 <see cref="DefaultSecretKey"/>。</param>
-    /// <param name="reconnectPolicy">重连退避策略。</param>
-    /// <param name="maxMessageBytes">单帧最大字节数。</param>
-    /// <param name="diagnostics">可选诊断回调。</param>
-    public OneBotWebSocketClient(
-        OneBotConnectionSettings settings,
-        ISecretStore secretStore,
-        string secretKey = DefaultSecretKey,
-        ReconnectPolicy? reconnectPolicy = null,
-        int maxMessageBytes = DefaultMaxMessageBytes,
-        Action<OneBotDiagnostic>? diagnostics = null)
-        : this(
-            settings,
-            CreateSecretProvider(secretStore, secretKey),
-            reconnectPolicy,
-            maxMessageBytes,
-            diagnostics)
-    {
     }
 
     /// <summary>当前连接状态。</summary>
@@ -236,14 +210,6 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
 
     /// <inheritdoc />
     public override string ToString() => $"OneBotWebSocketClient(端点 {_endpoint}, 状态 {State}, {_reconnectPolicy})";
-
-    private static Func<string?> CreateSecretProvider(ISecretStore secretStore, string secretKey)
-    {
-        ArgumentNullException.ThrowIfNull(secretStore);
-        ArgumentException.ThrowIfNullOrWhiteSpace(secretKey);
-
-        return () => secretStore.GetSecret(secretKey);
-    }
 
     private static Uri BuildEndpoint(string host, int port, bool useSsl)
     {
@@ -427,6 +393,19 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
         {
             return new SessionResult(SessionOutcome.Cancelled, Connected: false);
         }
+        catch (OneBotAccessTokenException ex)
+        {
+            // 令牌读不到是配置/密钥库问题，不是网络抖动：原因原样推给状态跟踪器，
+            // 用户在界面上能直接看到「令牌读取失败」而不是一句含糊的「等待重连」。
+            // 消息由异常类型固定提供，本身不含令牌；这里再过一次 Sanitize 是兜底。
+            var reason = Sanitize(ex.Message);
+            _tracker.RecordError(reason);
+            _tracker.TryTransition(ConnectionState.Reconnecting, reason);
+            Log(OneBotDiagnosticLevel.Error, $"连接已中止：{reason}", ex);
+
+            // 仍按「本次会话结束」返回，退避重连节奏交给外层，密钥恢复后可以自愈。
+            return new SessionResult(SessionOutcome.Completed, Connected: false);
+        }
         catch (Exception ex)
         {
             _tracker.RecordError(Sanitize(ex.Message));
@@ -483,9 +462,10 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
         }
         catch (Exception ex)
         {
-            // 取令牌失败不应让整个事件循环崩掉，退化为匿名连接。
-            token = null;
-            Log(OneBotDiagnosticLevel.Warning, "读取访问令牌失败，将以不带 Authorization 头的方式连接。", ex);
+            // fail-closed：「读不到令牌」不等于「没有令牌」。前者多半是密钥库/DPAPI 出问题，
+            // 退化成匿名连接只会把真正的故障掩盖成一次莫名其妙的握手失败。
+            // 空串或 null 仍然照常放行——本地 SnowLuma 未配 access token 是合法场景。
+            throw new OneBotAccessTokenException(ex);
         }
 
         _activeToken = token;
