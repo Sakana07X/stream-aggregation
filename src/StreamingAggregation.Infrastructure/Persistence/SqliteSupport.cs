@@ -71,6 +71,29 @@ internal static class SqliteCommandExtensions
 }
 
 /// <summary>
+/// "最近 N 条"这类列表查询的行数约定。仓储共用，避免每个仓储各写一套边界。
+/// </summary>
+internal static class QueryLimit
+{
+    /// <summary>下限。</summary>
+    internal const int Min = 1;
+
+    /// <summary>上限：够 UI 一次渲染一个页面，又不至于把大表拖进内存。</summary>
+    internal const int Max = 1000;
+
+    /// <summary>
+    /// 把调用方传入的行数钳制到 <c>[Min, Max]</c>。
+    /// </summary>
+    /// <remarks>
+    /// 必须钳制后再绑定参数，不能把原值直接丢给 SQL：SQLite 把<b>负数</b> <c>LIMIT</c>
+    /// 解释为"不限制"（传 -1 会把整张表拉进内存），而 <c>0</c> 会返回空列表——
+    /// 两种都不是"给我最近几条"想要的语义。钳制让边界输入退化成"取一条"，
+    /// 既不会炸内存，也不会让调用方误以为库里真的没有数据。
+    /// </remarks>
+    internal static int Clamp(int limit) => Math.Clamp(limit, Min, Max);
+}
+
+/// <summary>
 /// 生产环境默认时钟：以 UTC 读取当前时间。
 /// </summary>
 /// <remarks>

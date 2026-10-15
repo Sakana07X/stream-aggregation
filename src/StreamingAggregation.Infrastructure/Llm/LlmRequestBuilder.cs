@@ -3,7 +3,6 @@ using System.Globalization;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
-using StreamingAggregation.Core;
 using StreamingAggregation.Core.Configuration;
 using StreamingAggregation.Core.Models;
 
@@ -45,18 +44,39 @@ public static class LlmRequestBuilder
     /// <summary>OpenAI 兼容接口的相对路径。</summary>
     public const string ChatCompletionsPath = "/chat/completions";
 
-    /// <summary>分类与摘要的输出契约，放在 system 消息里。</summary>
+    /// <summary>
+    /// 分类与摘要的输出契约，放在 system 消息里。
+    /// </summary>
+    /// <remarks>
+    /// 六个字段与 <see cref="DigestSchemaValidator"/> 的契约一一对应：
+    /// 少写任何一个必填字段（<c>category</c> / <c>summary</c> / <c>action</c> /
+    /// <c>deadline</c> / <c>reason</c>）都会让整轮校验失败并回退到本地规则，
+    /// 所以这里把类型、取值范围和空值写法都写死。示例给的是模型最容易照抄的形状。
+    /// </remarks>
     public const string DefaultSystemPrompt = """
         你是一个 QQ 群聊摘要助手。请阅读下面某个群在一个时间窗口内的聊天记录，输出一条 JSON 摘要。
         规则：
-        1. 只输出一个 JSON 对象，不要输出解释、Markdown 代码块或任何多余文字。
-        2. JSON 必须包含且只包含以下三个字段：
+        1. 只输出一个 JSON 对象，不要输出 Markdown 代码块、前后缀说明或任何多余文字。
+        2. JSON 必须同时包含以下六个字段，字段名不要改动，也不要省略或新增字段：
            - category：字符串，取值必须是 "urgent"、"todo"、"study"、"notice"、"normal" 之一。
              urgent=需要立刻处理；todo=需要后续跟进的待办；study=值得留存的知识点；notice=公告或知会；normal=其它。
            - summary：字符串，一句话中文摘要，不超过 100 字，要覆盖群名与核心内容。
-           - reason：字符串，一句话说明为什么归到该分类。
-        3. 只能使用记录里出现的信息，不要臆造人物、事件或结论；无法判断时归为 "normal"。
-        4. 空消息、没有实质内容的闲聊，summary 写"本时段无实质内容"，category 填 "normal"。
+           - action：字符串，一句话写清要做什么，不超过 200 字；本轮没有需要跟进的事时写空字符串 ""。
+           - deadline：字符串或 null，action 的截止时间；没有明确截止时间时写 null。
+             有截止时间时用 "yyyy-MM-ddTHH:mm:ss" 格式，例如 "2026-10-17T18:00:00"，
+             不要写"明天""下周五"这类相对表述。
+           - importance：字符串，取值必须是 "high"、"medium"、"low" 之一。
+             high=当天内就要处理；medium=几天内跟进；low=有空再看。action 为空字符串时填 "medium"。
+           - reason：字符串，一句话说明为什么归到该分类，不超过 100 字。
+        3. 只能使用记录里出现的信息，不要臆造人物、事件、时间或结论；无法判断时 category 填 "normal"。
+        4. 空消息、没有实质内容的闲聊：summary 写"本时段无实质内容"，category 填 "normal"，
+           action 写 ""，deadline 填 null。
+
+        有行动项时输出：
+        {"category":"todo","summary":"张三承诺周五前提交接口文档","action":"跟进张三提交接口文档","deadline":"2026-10-17T18:00:00","importance":"high","reason":"群友明确认领了带截止时间的待办"}
+
+        没有行动项时输出：
+        {"category":"study","summary":"群里讨论了 Redis 持久化方案的取舍","action":"","deadline":null,"importance":"medium","reason":"内容是可供后续查阅的知识整理"}
         """;
 
     private static readonly JsonWriterOptions WriterOptions = new()
@@ -325,11 +345,16 @@ public static class LlmRequestBuilder
 }
 
 /// <summary>
-/// 解析 OpenAI 兼容 <c>/chat/completions</c> 的响应，并映射成 Core 的 <see cref="Digest"/>。
+/// 解析 OpenAI 兼容 <c>/chat/completions</c> 的响应外壳，取出模型正文。
 /// </summary>
 /// <remarks>
 /// 面向"OpenAI 兼容"而非"OpenAI 本身"：<c>content</c> 既可能是字符串，也可能是
 /// <c>[{ "type": "text", "text": … }]</c> 的分段数组；两种都要认。
+/// <para>
+/// 这里只管"把正文从信封里掏出来"。正文本身是否符合摘要契约，由
+/// <see cref="LlmResultMapper.MapOrFallback"/> 负责——校验不通过会回退到本地规则，
+/// 而不是在这里被判成一次失败的调用。
+/// </para>
 /// </remarks>
 internal static class LlmResponseParser
 {
@@ -400,122 +425,6 @@ internal static class LlmResponseParser
     }
 
     /// <summary>
-    /// 把模型输出解析成 <see cref="Digest"/>；失败时返回 <see langword="false"/> 与原因。
-    /// </summary>
-    /// <param name="content">模型正文。</param>
-    /// <param name="digestId">摘要主键，由调用方生成。</param>
-    /// <param name="batchId">来源批次标识。</param>
-    /// <param name="createdAt">摘要创建时间。</param>
-    /// <param name="digest">解析结果。</param>
-    /// <param name="reason">失败原因；成功时为 <see langword="null"/>。</param>
-    internal static bool TryParseDigest(
-        string content,
-        string digestId,
-        string batchId,
-        DateTime createdAt,
-        out Digest? digest,
-        out string? reason)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(digestId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(batchId);
-
-        digest = null;
-        reason = null;
-
-        var payload = LlmRequestBuilder.StripCodeFence(content);
-
-        JsonDocument document;
-        try
-        {
-            document = JsonDocument.Parse(payload);
-        }
-        catch (JsonException ex)
-        {
-            reason = $"模型输出不是合法 JSON：{ex.Message}";
-            return false;
-        }
-
-        using (document)
-        {
-            var root = document.RootElement;
-            if (root.ValueKind != JsonValueKind.Object)
-            {
-                reason = $"模型输出的 JSON 根节点是 {root.ValueKind}，期望 object。";
-                return false;
-            }
-
-            var summary = ReadString(root, "summary");
-            if (summary.Length == 0)
-            {
-                reason = "模型输出缺少非空的 summary 字段。";
-                return false;
-            }
-
-            digest = new Digest
-            {
-                Id = digestId,
-                BatchId = batchId,
-                Category = ParseCategory(root, "category"),
-                Summary = summary,
-                Reason = ReadString(root, "reason"),
-                CreatedAt = createdAt,
-            };
-
-            return true;
-        }
-    }
-
-    /// <summary>解析分类字段；缺失或无法识别时归为 <see cref="DigestCategory.Normal"/>。</summary>
-    private static DigestCategory ParseCategory(JsonElement root, string name)
-    {
-        if (!root.TryGetProperty(name, out var element))
-        {
-            return DigestCategory.Normal;
-        }
-
-        return element.ValueKind switch
-        {
-            JsonValueKind.String => ParseCategoryLabel(element.GetString()),
-            // 少数实现会回数字枚举值，直接按序号还原。
-            JsonValueKind.Number when element.TryGetInt32(out var ordinal) => FromOrdinal(ordinal),
-            _ => DigestCategory.Normal,
-        };
-    }
-
-    /// <summary>接受英文枚举名（不区分大小写）与中文标签。</summary>
-    private static DigestCategory ParseCategoryLabel(string? label)
-    {
-        if (string.IsNullOrWhiteSpace(label))
-        {
-            return DigestCategory.Normal;
-        }
-
-        var text = label.Trim();
-
-        if (Enum.TryParse<DigestCategory>(text, ignoreCase: true, out var parsed) && Enum.IsDefined(parsed))
-        {
-            return parsed;
-        }
-
-        return text switch
-        {
-            "紧急" or "急" => DigestCategory.Urgent,
-            "待办" or "任务" => DigestCategory.Todo,
-            "学习" or "知识" => DigestCategory.Study,
-            "通知" or "公告" => DigestCategory.Notice,
-            "普通" => DigestCategory.Normal,
-            _ => DigestCategory.Normal,
-        };
-    }
-
-    private static DigestCategory FromOrdinal(int ordinal)
-    {
-        var category = (DigestCategory)ordinal;
-
-        return Enum.IsDefined(category) ? category : DigestCategory.Normal;
-    }
-
-    /// <summary>
     /// 读取 content：字符串直接用；分段数组则把 <c>text</c> 段按顺序拼接。
     /// </summary>
     private static string ReadContent(JsonElement content)
@@ -562,9 +471,4 @@ internal static class LlmResponseParser
 
         return "未提供说明。";
     }
-
-    private static string ReadString(JsonElement root, string name) =>
-        root.TryGetProperty(name, out var element) && element.ValueKind == JsonValueKind.String
-            ? (element.GetString() ?? string.Empty).Trim()
-            : string.Empty;
 }

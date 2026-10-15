@@ -9,7 +9,14 @@
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <TextBlock Text="摘要" Style="{StaticResource TitleTextBlockStyle}" Margin="0,0,0,12" />
+        <Grid Margin="0,0,0,12" ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="摘要" Style="{StaticResource TitleTextBlockStyle}" />
+            <Button Grid.Column="1" Content="刷新" Click="RefreshButton_Click" VerticalAlignment="Center" />
+        </Grid>
 
         <ScrollViewer Grid.Row="1">
             <StackPanel Spacing="16">

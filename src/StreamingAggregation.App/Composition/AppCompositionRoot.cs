@@ -247,6 +247,9 @@ public sealed class AppCompositionRoot : IDisposable
                 sp.Resolve<IClock>()))
             .AddSingleton<IDigestStore, DigestRepository>(sp => new DigestRepository(
                 sp.Resolve<ISqliteConnectionFactory>()))
+            .AddSingleton<ITaskStore, TaskRepository>(sp => new TaskRepository(
+                sp.Resolve<ISqliteConnectionFactory>(),
+                sp.Resolve<IClock>()))
             .AddSingleton<RetentionCleaner>(sp => new RetentionCleaner(
                 sp.Resolve<ISqliteConnectionFactory>(),
                 sp.Resolve<IClock>()))
@@ -257,6 +260,7 @@ public sealed class AppCompositionRoot : IDisposable
 
             // 摘要客户端只读"最新设置"，因此注入的是取当前快照的委托而不是某个固定对象；
             // 用户改完设置无需重建 HttpClient，下一次调用就会用上新值。
+            .AddSingleton<LlmResultMapper>(sp => new LlmResultMapper(sp.Resolve<IClock>()))
             .AddSingleton<ISummarizationClient, OpenAiCompatibleClient>(sp => new OpenAiCompatibleClient(
                 () => _settings.Model,
                 sp.Resolve<ISecretStore>(),
@@ -265,7 +269,8 @@ public sealed class AppCompositionRoot : IDisposable
                 static diagnostic => Log(PipelineLogLevel.Debug, diagnostic.Message),
                 promptOptions: null,
                 apiKeySecretKey: SettingsStore.ModelApiKeySecretKey,
-                clock: sp.Resolve<IClock>()));
+                clock: sp.Resolve<IClock>(),
+                resultMapper: sp.Resolve<LlmResultMapper>()));
     }
 
     /// <summary>登记聚合窗口、过滤器与事件源。</summary>
@@ -373,6 +378,7 @@ public sealed class AppCompositionRoot : IDisposable
             _services.Resolve<IMessageStore>(),
             _services.Resolve<IBatchStore>(),
             _services.Resolve<IDigestStore>(),
+            _services.Resolve<ITaskStore>(),
             _services.Resolve<IAggregationWindow>(),
             _services.Resolve<ISummarizationClient>(),
             _services.Resolve<INotificationService>(),
@@ -442,6 +448,10 @@ public sealed class AppCompositionRoot : IDisposable
     }
 
     /// <summary>构造页面并注入视图模型。</summary>
+    /// <remarks>
+    /// 存储与封送委托一起注入：页面读取数据在线程池上继续，只有拿到 <see cref="QueueOnUiThread"/>
+    /// 才能把结果安全地搬回 UI 线程，否则首屏加载就会以 RPC_E_WRONG_THREAD 崩掉。
+    /// </remarks>
     /// <param name="pageType">页面类型。</param>
     /// <returns>页面实例。</returns>
     private Page CreatePage(Type pageType)
@@ -451,9 +461,12 @@ public sealed class AppCompositionRoot : IDisposable
         return pageType switch
         {
             var type when type == typeof(SettingsPage) => new SettingsPage(SettingsViewModel),
-            var type when type == typeof(DigestPage) => new DigestPage(),
-            var type when type == typeof(TodoPage) => new TodoPage(),
-            var type when type == typeof(MessagesPage) => new MessagesPage(),
+            var type when type == typeof(DigestPage) =>
+                new DigestPage(_services.Resolve<IDigestStore>(), QueueOnUiThread),
+            var type when type == typeof(TodoPage) =>
+                new TodoPage(_services.Resolve<ITaskStore>(), QueueOnUiThread),
+            var type when type == typeof(MessagesPage) =>
+                new MessagesPage(_services.Resolve<IMessageStore>(), QueueOnUiThread),
             _ => throw new NotSupportedException($"未注册页面类型 {pageType.FullName}。"),
         };
     }
@@ -571,7 +584,8 @@ public sealed class AppCompositionRoot : IDisposable
     }
 
     /// <summary>
-    /// 连接状态绑定专用的封送入口：丢弃"是否排队成功"，因为状态推送失败无需重试。
+    /// 界面封送入口：丢弃"是否排队成功"，因为状态推送与页面数据回填都无需重试——
+    /// 真正需要等待结果的场景另有 <see cref="RunOnUiAsync"/>。
     /// </summary>
     /// <param name="action">要执行的动作。</param>
     private void QueueOnUiThread(Action action) => _ = TryMarshal(action);

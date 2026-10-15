@@ -84,23 +84,97 @@ public sealed class DigestRepository : IDigestStore
             """;
         command.Bind("$batch_id", batchId);
 
+        return await ReadAllAsync(command, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 取最近保存的摘要，按创建时间降序（新的在前）。
+    /// </summary>
+    /// <remarks>
+    /// 排序键 <c>created_at DESC, id DESC</c>：只按 <c>created_at</c> 排时，
+    /// 同一批窗口内生成的摘要时间戳可能完全相同，次级键保证每次翻页的行序稳定、不会重影或漏行。
+    /// </remarks>
+    /// <param name="limit">最多返回多少条；超出 1–1000 的取值会被钳制到该区间。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    public async Task<IReadOnlyList<Digest>> GetRecentAsync(
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT {SelectColumns}
+            FROM digests
+            ORDER BY created_at DESC, id DESC
+            LIMIT $limit;
+            """;
+        command.Bind("$limit", QueryLimit.Clamp(limit));
+
+        return await ReadAllAsync(command, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 取某个分类下最近保存的摘要，按创建时间降序（新的在前）。
+    /// </summary>
+    /// <remarks>
+    /// 次级排序键与 <see cref="GetRecentAsync"/> 一致（<c>id DESC</c>），保证同分类列表翻页稳定。
+    /// </remarks>
+    /// <param name="category">目标分类。</param>
+    /// <param name="limit">最多返回多少条；超出 1–1000 的取值会被钳制到该区间。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="category"/> 不是已定义的枚举值。调用方错误，不能等到读行时再报"数据库有脏数据"。
+    /// </exception>
+    public async Task<IReadOnlyList<Digest>> GetByCategoryAsync(
+        DigestCategory category,
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Enum.IsDefined(category))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(category), category, $"未知的摘要分类：{(int)category}。");
+        }
+
+        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT {SelectColumns}
+            FROM digests
+            WHERE category = $category
+            ORDER BY created_at DESC, id DESC
+            LIMIT $limit;
+            """;
+        command
+            .Bind("$category", (int)category)
+            .Bind("$limit", QueryLimit.Clamp(limit));
+
+        return await ReadAllAsync(command, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<IReadOnlyList<Digest>> ReadAllAsync(
+        SqliteCommand command,
+        CancellationToken cancellationToken)
+    {
         var digests = new List<Digest>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            digests.Add(new Digest
-            {
-                Id = reader.GetRequiredString(0),
-                BatchId = reader.GetRequiredString(1),
-                Category = ToDigestCategory(reader.GetInt32(2)),
-                Summary = reader.GetRequiredString(3),
-                Reason = reader.GetRequiredString(4),
-                CreatedAt = reader.GetDateTime(5),
-            });
+            digests.Add(ReadDigest(reader));
         }
 
         return digests;
     }
+
+    private static Digest ReadDigest(SqliteDataReader reader) => new()
+    {
+        Id = reader.GetRequiredString(0),
+        BatchId = reader.GetRequiredString(1),
+        Category = ToDigestCategory(reader.GetInt32(2)),
+        Summary = reader.GetRequiredString(3),
+        Reason = reader.GetRequiredString(4),
+        CreatedAt = reader.GetDateTime(5),
+    };
 
     private static DigestCategory ToDigestCategory(int stored)
     {

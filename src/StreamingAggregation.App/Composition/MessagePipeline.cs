@@ -22,7 +22,7 @@ internal enum PipelineLogLevel
 }
 
 /// <summary>
-/// 消息管线：把 OneBot 事件流转成"消息落库 → 进聚合窗口 → 到点摘要 → 紧急通知"。
+/// 消息管线：把 OneBot 事件流转成"消息落库 → 进聚合窗口 → 到点摘要 → 待办入库 → 紧急通知"。
 /// </summary>
 /// <remarks>
 /// <para>
@@ -51,6 +51,7 @@ internal sealed class MessagePipeline
     private readonly IMessageStore _messageStore;
     private readonly IBatchStore _batchStore;
     private readonly IDigestStore _digestStore;
+    private readonly ITaskStore _taskStore;
     private readonly IAggregationWindow _window;
     private readonly ISummarizationClient _summarizer;
     private readonly INotificationService _notifications;
@@ -67,6 +68,7 @@ internal sealed class MessagePipeline
     /// <param name="messageStore">消息存储。</param>
     /// <param name="batchStore">批次存储。</param>
     /// <param name="digestStore">摘要存储。</param>
+    /// <param name="taskStore">行动项（待办）存储。</param>
     /// <param name="window">聚合窗口。</param>
     /// <param name="summarizer">摘要客户端。</param>
     /// <param name="notifications">通知通道。</param>
@@ -80,6 +82,7 @@ internal sealed class MessagePipeline
         IMessageStore messageStore,
         IBatchStore batchStore,
         IDigestStore digestStore,
+        ITaskStore taskStore,
         IAggregationWindow window,
         ISummarizationClient summarizer,
         INotificationService notifications,
@@ -93,6 +96,7 @@ internal sealed class MessagePipeline
         _messageStore = messageStore ?? throw new ArgumentNullException(nameof(messageStore));
         _batchStore = batchStore ?? throw new ArgumentNullException(nameof(batchStore));
         _digestStore = digestStore ?? throw new ArgumentNullException(nameof(digestStore));
+        _taskStore = taskStore ?? throw new ArgumentNullException(nameof(taskStore));
         _window = window ?? throw new ArgumentNullException(nameof(window));
         _summarizer = summarizer ?? throw new ArgumentNullException(nameof(summarizer));
         _notifications = notifications ?? throw new ArgumentNullException(nameof(notifications));
@@ -233,7 +237,7 @@ internal sealed class MessagePipeline
         }
     }
 
-    /// <summary>摘要单个批次：标记处理中 → 调模型 → 落库 → 按分类通知。</summary>
+    /// <summary>摘要单个批次：标记处理中 → 调模型 → 落库（摘要 + 行动项）→ 按分类通知。</summary>
     /// <param name="batch">到期批次。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     private async Task SummarizeAsync(AggregationBatch batch, CancellationToken cancellationToken)
@@ -263,11 +267,81 @@ internal sealed class MessagePipeline
         }
 
         await _digestStore.SaveAsync(digest, cancellationToken).ConfigureAwait(false);
+        await PersistActionItemsAsync(result.ActionItems, batch, cancellationToken).ConfigureAwait(false);
         await _batchStore
             .SaveAsync(batch with { Status = BatchStatus.Completed }, cancellationToken)
             .ConfigureAwait(false);
 
         NotifyIfUrgent(digest);
+    }
+
+    /// <summary>把本轮摘要产出的行动项逐个落库，单个失败只丢这一条。</summary>
+    /// <remarks>
+    /// <para>
+    /// 待办是摘要之外的独立产出，写不进去不该把已经成功的摘要判成失败——因此每个行动项各自
+    /// 兜一层 <c>try/catch</c>，失败只记日志。整段唯一会向外抛的是取消：管线正在停，
+    /// 继续写库没有意义。
+    /// </para>
+    /// <para>
+    /// 行动项 ID 按批次确定性生成（见 <c>LlmResultMapper</c>），同一批次重跑会命中同一行，
+    /// 所以落库前必须保留用户状态，详见 <see cref="PreserveUserStatusAsync"/>。
+    /// </para>
+    /// </remarks>
+    /// <param name="actionItems">本轮产出的行动项，可为空。</param>
+    /// <param name="batch">行动项所属批次，用于日志定位。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private async Task PersistActionItemsAsync(
+        IReadOnlyList<ActionItem> actionItems,
+        AggregationBatch batch,
+        CancellationToken cancellationToken)
+    {
+        foreach (var actionItem in actionItems)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                var item = await PreserveUserStatusAsync(actionItem, cancellationToken).ConfigureAwait(false);
+                await _taskStore.SaveAsync(item, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log(
+                    PipelineLogLevel.Warning,
+                    string.Format(
+                        CultureInfo.CurrentCulture,
+                        "批次 {0}（群 {1}）的行动项 {2} 落库失败：{3}",
+                        batch.Id,
+                        batch.GroupId,
+                        actionItem.Id,
+                        ex.Message));
+            }
+        }
+    }
+
+    /// <summary>
+    /// 沿用库里已有的「完成 / 忽略」状态，再交给 <see cref="ITaskStore.SaveAsync"/> 全量覆盖。
+    /// </summary>
+    /// <remarks>
+    /// <c>SaveAsync</c> 是全量 UPSERT，<c>completed</c> / <c>ignored</c> 两列也会被覆盖，
+    /// 而模型每次都会重新产出默认状态的全量行动项。同一批次重跑若不先把用户状态捞回来，
+    /// 用户已经勾掉的待办会重新冒回待办列表——这是静默丢用户操作，不能接受。
+    /// 代价只是每个行动项一次主键查询，相对刚发生的模型调用可以忽略。
+    /// </remarks>
+    /// <param name="actionItem">本轮产出的行动项。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    /// <returns>带上库内既有用户状态的行动项；库里还没有该 ID 时原样返回。</returns>
+    private async Task<ActionItem> PreserveUserStatusAsync(ActionItem actionItem, CancellationToken cancellationToken)
+    {
+        var existing = await _taskStore.GetByIdAsync(actionItem.Id, cancellationToken).ConfigureAwait(false);
+
+        return existing is null
+            ? actionItem
+            : actionItem with { Completed = existing.Completed, Ignored = existing.Ignored };
     }
 
     /// <summary>摘要分类为紧急时发一条高优先级通知。</summary>

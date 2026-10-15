@@ -66,7 +66,7 @@ public sealed record ValidatedDigestDraft
     /// <summary>截止时间（UTC）；未提供或无法解析时为 null。</summary>
     public DateTime? Deadline { get; init; }
 
-    /// <summary>重要程度；仅在 <see cref="HasActionItem"/> 为 true 时使用。</summary>
+    /// <summary>重要程度；仅在 <see cref="HasActionItem"/> 为 true 时使用。缺失时降级为 <see cref="Importance.Medium"/>。</summary>
     public required Importance Importance { get; init; }
 
     /// <summary>是否要生成行动项。</summary>
@@ -127,14 +127,28 @@ public sealed class DigestValidationResult
 /// 契约：根节点是对象，必须同时包含
 /// <c>category</c>、<c>summary</c>、<c>action</c>、<c>deadline</c>、
 /// <c>importance</c>、<c>reason</c> 六个字段。字段名大小写不敏感，多余字段忽略。
+/// 其中 <c>importance</c> 是软字段：整个字段缺失也算合法（见下）。
 /// </para>
 /// <para>
 /// 判失败的四种情况：整体不是合法 JSON、字段缺失、字段 JSON 类型不对、枚举取值非法；
 /// 另有"必填文本为空"与"文本超长"同样判失败。
 /// </para>
 /// <para>
-/// 唯一下降级项是 <c>deadline</c>：<c>null</c>、空串或无法解析的日期串都按"没有截止时间"处理，
-/// 不影响其余字段的可用性。
+/// 两处降级，都不丢弃整条摘要：
+/// <list type="bullet">
+/// <item><description>
+/// <c>deadline</c>：<c>null</c>、空串或无法解析的日期串都按"没有截止时间"处理。
+/// </description></item>
+/// <item><description>
+/// <c>importance</c>：字段缺失、<c>null</c>、空串或无法识别的枚举名都按
+/// <see cref="DefaultImportance"/> 处理。重要度是"锦上添花"的排序键，
+/// 猜错一次不该让摘要与行动项一起作废。
+/// </description></item>
+/// </list>
+/// </para>
+/// <para>
+/// 降级只覆盖"信息缺失或读不懂"，不覆盖"契约写错了"：JSON 类型不对
+/// （例如 <c>importance</c> 给了数字）仍然判失败，那是模型的硬错误，值得看到。
 /// </para>
 /// <para>
 /// 无状态、无 I/O，不依赖 <see cref="Core.Abstractions.IClock"/>。
@@ -150,6 +164,12 @@ public static class DigestSchemaValidator
 
     /// <summary>动作描述长度上限，超出判失败。</summary>
     public const int MaxActionLength = 500;
+
+    /// <summary>
+    /// <c>importance</c> 缺失或读不懂时的兜底取值。
+    /// 选 <see cref="Importance.Medium"/>：它对"随手扫一眼"和"尽快跟进"都不算错。
+    /// </summary>
+    public const Importance DefaultImportance = Importance.Medium;
 
     private const string RootField = "(root)";
 
@@ -221,7 +241,7 @@ public static class DigestSchemaValidator
     /// <summary>合法枚举取值清单，写进提示词与错误提示，避免模型反复踩同一个坑。</summary>
     public static string DescribeAllowedCategories() => EnumNameMap<DigestCategory>.Allowed;
 
-    /// <summary>合法重要度清单。</summary>
+    /// <summary>合法重要度清单；缺失或无法识别时按 <see cref="DefaultImportance"/> 处理。</summary>
     public static string DescribeAllowedImportances() => EnumNameMap<Importance>.Allowed;
 
     private static DigestValidationResult ValidateRoot(JsonElement root)
@@ -239,7 +259,7 @@ public static class DigestSchemaValidator
 
         var errors = new List<DigestValidationError>();
         var category = ReadEnum<DigestCategory>(root, CategoryField, errors);
-        var importance = ReadEnum<Importance>(root, ImportanceField, errors);
+        var importance = ReadImportance(root, errors);
         var summary = ReadRequiredText(root, SummaryField, MaxSummaryLength, errors);
         var reason = ReadRequiredText(root, ReasonField, MaxReasonLength, errors);
         var action = ReadOptionalText(root, ActionField, MaxActionLength, errors);
@@ -257,7 +277,7 @@ public static class DigestSchemaValidator
             Reason = reason!,
             Action = action,
             Deadline = deadline,
-            Importance = importance!.Value
+            Importance = importance
         });
     }
 
@@ -330,6 +350,36 @@ public static class DigestSchemaValidator
             DigestValidationErrorKind.InvalidEnum,
             $"取值「{text}」不在允许范围：{EnumNameMap<TEnum>.Allowed}。"));
         return null;
+    }
+
+    /// <summary>
+    /// 读取 <c>importance</c>，缺失或读不懂时降级为 <see cref="DefaultImportance"/>，不报错。
+    /// </summary>
+    /// <remarks>
+    /// 与 <c>deadline</c> 同一思路：重要度只是行动项的排序键，
+    /// 模型漏写或写了个 "critical"，不该把已经合格的摘要和动作一起丢掉。
+    /// 但 JSON 类型不对仍判失败——那是契约写错，不是信息缺失，值得被看见。
+    /// </remarks>
+    private static Importance ReadImportance(JsonElement root, List<DigestValidationError> errors)
+    {
+        if (!TryFindField(root, ImportanceField, out var element))
+        {
+            return DefaultImportance;
+        }
+
+        if (element.ValueKind == JsonValueKind.Null)
+        {
+            return DefaultImportance;
+        }
+
+        if (element.ValueKind != JsonValueKind.String)
+        {
+            errors.Add(TypeMismatch(ImportanceField, $"期望字符串或 null，得到 {Describe(element.ValueKind)}。"));
+            return DefaultImportance;
+        }
+
+        var text = element.GetString()?.Trim() ?? string.Empty;
+        return EnumNameMap<Importance>.Map.TryGetValue(text, out var value) ? value : DefaultImportance;
     }
 
     private static string? ReadRequiredText(
@@ -458,6 +508,23 @@ public static class DigestSchemaValidator
         out JsonElement element,
         List<DigestValidationError> errors)
     {
+        if (TryFindField(root, field, out element))
+        {
+            return true;
+        }
+
+        errors.Add(new DigestValidationError(
+            field,
+            DigestValidationErrorKind.FieldMissing,
+            $"缺少必填字段「{field}」。"));
+        return false;
+    }
+
+    /// <summary>
+    /// 找字段但不记账，供可选字段使用：找不到只是"没有值"，不是契约错误。
+    /// </summary>
+    private static bool TryFindField(JsonElement root, string field, out JsonElement element)
+    {
         // 字段名大小写不敏感：模型写 "Category" 和 "category" 都接受，取先出现的那个。
         foreach (var property in root.EnumerateObject())
         {
@@ -469,10 +536,6 @@ public static class DigestSchemaValidator
         }
 
         element = default;
-        errors.Add(new DigestValidationError(
-            field,
-            DigestValidationErrorKind.FieldMissing,
-            $"缺少必填字段「{field}」。"));
         return false;
     }
 

@@ -9,7 +9,14 @@
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <TextBlock Text="待办" Style="{StaticResource TitleTextBlockStyle}" Margin="0,0,0,12" />
+        <Grid Margin="0,0,0,12" ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="待办" Style="{StaticResource TitleTextBlockStyle}" />
+            <Button Grid.Column="1" Content="刷新" Click="RefreshButton_Click" VerticalAlignment="Center" />
+        </Grid>
 
         <ListView x:Name="TodoListView" Grid.Row="1" SelectionMode="None">
             <ListView.ItemTemplate>

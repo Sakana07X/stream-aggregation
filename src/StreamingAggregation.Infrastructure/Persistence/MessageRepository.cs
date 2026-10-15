@@ -98,6 +98,32 @@ public sealed class MessageRepository : IMessageStore
         return await ReadAllAsync(command, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// 取最近写入的消息，按时间降序（新的在前），不限群组。
+    /// </summary>
+    /// <remarks>
+    /// 排序键 <c>timestamp DESC, message_id DESC</c>：次级键与 <see cref="GetByGroupAsync"/> 同理，
+    /// 保证时间戳相同的消息（批量导入、OneBot 重发）之间顺序稳定，翻页不重影不漏行。
+    /// </remarks>
+    /// <param name="limit">最多返回多少条；超出 1–1000 的取值会被钳制到该区间。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    public async Task<IReadOnlyList<Message>> GetRecentAsync(
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT {SelectColumns}
+            FROM messages
+            ORDER BY timestamp DESC, message_id DESC
+            LIMIT $limit;
+            """;
+        command.Bind("$limit", QueryLimit.Clamp(limit));
+
+        return await ReadAllAsync(command, cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>按保留期删除过期消息（保留期为负数或零时直接返回，不做删除）。</summary>
     public Task CleanupAsync(TimeSpan retention, CancellationToken cancellationToken = default)
     {

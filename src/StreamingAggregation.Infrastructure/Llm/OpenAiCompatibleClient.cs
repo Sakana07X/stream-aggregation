@@ -21,9 +21,14 @@ namespace StreamingAggregation.Infrastructure.Llm;
 /// 明文 HTTP 仅在目标是 localhost / 127.0.0.0/8 / ::1 等回环地址时允许。
 /// 违反此策略的端点会在 <see cref="Prepare"/> 阶段被归一为
 /// <see cref="LlmFailureKind.ConfigurationInvalid"/> 失败结果。</para>
-/// <para><b>失败处理</b>：超时、网络失败、HTTP 非 2xx、响应非 JSON、模型输出无法解析、
-/// 配置缺失，全部归一成 <see cref="LlmResult"/> 里 <c>IsSuccess = false</c> 的结果；
-/// 只有调用方主动取消才抛 <see cref="OperationCanceledException"/>。</para>
+/// <para><b>失败处理</b>：超时、网络失败、HTTP 非 2xx、响应不是预期的 JSON 外壳、
+/// 配置缺失——也就是<b>根本没拿到模型正文</b>的情况——全部归一成 <see cref="LlmResult"/>
+/// 里 <c>IsSuccess = false</c> 的结果；只有调用方主动取消才抛 <see cref="OperationCanceledException"/>。</para>
+/// <para><b>拿到正文之后</b>：模型输出交给 <see cref="LlmResultMapper.MapOrFallback"/>
+/// 校验并映射。校验不通过不会让整轮失败，而是改用 <see cref="FallbackDigestBuilder"/>
+/// 的本地规则摘要（<c>Digest.Id</c> 变成 <c>fb-d-{batchId}</c>），并记一条
+/// <see cref="LlmDiagnosticLevel.Warning"/> 诊断；批次因此仍算成功，
+/// 只是摘要质量降级。这样"模型偶尔答非所问"不会连带整轮聚合报废。</para>
 /// <para><b>不阻塞消息接收</b>：整条链路全异步，每一处 await 都带 <c>ConfigureAwait(false)</c>，
 /// 在 WinUI 界面线程上调用也不会把续体切回界面线程；本类型不做任何同步等待
 /// （不使用 <c>.Result</c> / <c>.Wait()</c>），也不会自己开线程池工作项。</para>
@@ -53,6 +58,7 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
     private readonly LlmPromptOptions _promptOptions;
     private readonly string _apiKeySecretKey;
     private readonly IClock _clock;
+    private readonly LlmResultMapper _mapper;
 
     /// <summary>
     /// 使用设置提供委托创建客户端。设置可在运行时被替换，<b>每次调用都会重新读取</b>。
@@ -64,7 +70,8 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
     /// <param name="diagnostics">可选诊断回调，收到的是已脱敏的消息。</param>
     /// <param name="promptOptions">提示词与采样参数。</param>
     /// <param name="apiKeySecretKey">API Key 在密钥库中的键名。</param>
-    /// <param name="clock">摘要创建时间的时间源。</param>
+    /// <param name="clock">摘要创建时间与相对日期换算的时间源。</param>
+    /// <param name="resultMapper">模型输出映射器；不传时按 <paramref name="clock"/> 新建一个。</param>
     public OpenAiCompatibleClient(
         Func<ModelSettings> settingsProvider,
         ISecretStore secretStore,
@@ -73,7 +80,8 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
         Action<LlmDiagnostic>? diagnostics = null,
         LlmPromptOptions? promptOptions = null,
         string apiKeySecretKey = DefaultApiKeySecretKey,
-        IClock? clock = null)
+        IClock? clock = null,
+        LlmResultMapper? resultMapper = null)
     {
         ArgumentNullException.ThrowIfNull(settingsProvider);
         ArgumentNullException.ThrowIfNull(secretStore);
@@ -88,6 +96,9 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
         _promptOptions = promptOptions ?? LlmPromptOptions.Default;
         _apiKeySecretKey = apiKeySecretKey;
         _clock = clock ?? SystemClock.Instance;
+
+        // 映射器与记录器共用同一个时钟：回退摘要的创建时间与 llm_calls 记录时间才对得上。
+        _mapper = resultMapper ?? new LlmResultMapper(_clock);
     }
 
     /// <summary>
@@ -100,7 +111,8 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
     /// <param name="diagnostics">可选诊断回调。</param>
     /// <param name="promptOptions">提示词与采样参数。</param>
     /// <param name="apiKeySecretKey">API Key 在密钥库中的键名。</param>
-    /// <param name="clock">摘要创建时间的时间源。</param>
+    /// <param name="clock">摘要创建时间与相对日期换算的时间源。</param>
+    /// <param name="resultMapper">模型输出映射器；不传时按 <paramref name="clock"/> 新建一个。</param>
     public OpenAiCompatibleClient(
         ModelSettings settings,
         ISecretStore secretStore,
@@ -109,7 +121,8 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
         Action<LlmDiagnostic>? diagnostics = null,
         LlmPromptOptions? promptOptions = null,
         string apiKeySecretKey = DefaultApiKeySecretKey,
-        IClock? clock = null)
+        IClock? clock = null,
+        LlmResultMapper? resultMapper = null)
         : this(
             () => settings ?? throw new InvalidOperationException("模型设置不能为 null。"),
             secretStore,
@@ -118,7 +131,8 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
             diagnostics,
             promptOptions,
             apiKeySecretKey,
-            clock)
+            clock,
+            resultMapper)
     {
         ArgumentNullException.ThrowIfNull(settings);
     }
@@ -342,7 +356,7 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
         return request;
     }
 
-    /// <summary>读取响应：状态码、正文、模型输出与摘要解析。</summary>
+    /// <summary>读取响应：状态码、正文、模型输出与摘要映射。</summary>
     private async Task<CallOutcome> ReadResponseAsync(
         HttpResponseMessage response,
         AggregationBatch batch,
@@ -366,6 +380,7 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
 
         var payload = await ReadBoundedAsync(response.Content, MaxResponseChars, cancellationToken).ConfigureAwait(false);
 
+        // 外壳层面取不到正文＝根本没有模型输出，按失败处理。
         if (!LlmResponseParser.TryExtractContent(payload, out var content, out var extractReason))
         {
             return CallOutcome.Failed(
@@ -375,23 +390,33 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
                 promptChars);
         }
 
-        if (!LlmResponseParser.TryParseDigest(
-                content,
-                Guid.NewGuid().ToString("N"),
-                batch.Id,
-                _clock.Now,
-                out var digest,
-                out var digestReason))
+        // 正文拿到了，就一定会有摘要：不合格只是降级，不是失败。
+        var mapping = _mapper.MapOrFallback(batch, content);
+
+        if (mapping.UsedFallback)
         {
-            return CallOutcome.Failed(
-                prepared.EndpointLabel,
-                LlmFailureKind.InvalidResponse,
-                Redact(digestReason!, apiKey),
-                promptChars,
-                completionChars: content.Length);
+            // 回退必须留痕，否则"摘要质量突然变差"这种问题在现场无法与模型故障区分开。
+            Log(
+                LlmDiagnosticLevel.Warning,
+                Redact(
+                    $"模型输出未通过摘要契约校验，已改用本地规则摘要：" +
+                    $"[{batch.Id}] {DescribeValidationErrors(mapping.ValidationErrors)}",
+                    apiKey),
+                null);
         }
 
-        return CallOutcome.Succeeded(prepared.EndpointLabel, content, digest!, promptChars);
+        return CallOutcome.Succeeded(prepared.EndpointLabel, content, mapping, promptChars);
+    }
+
+    /// <summary>把校验失败明细压成一行，写进诊断日志。</summary>
+    private static string DescribeValidationErrors(IReadOnlyList<DigestValidationError> errors)
+    {
+        if (errors.Count == 0)
+        {
+            return "校验未通过，但未给出明细。";
+        }
+
+        return string.Join("; ", errors.Select(error => error.ToString()));
     }
 
     /// <summary>尽力写入调用记录；记录失败不影响摘要结果，也不向外抛。</summary>
@@ -507,7 +532,8 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
             string content,
             int promptChars,
             int completionChars,
-            Digest? digest)
+            Digest? digest,
+            IReadOnlyList<ActionItem> actionItems)
         {
             Success = success;
             FailureKind = failureKind;
@@ -517,6 +543,7 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
             PromptChars = promptChars;
             CompletionChars = completionChars;
             Digest = digest;
+            ActionItems = actionItems;
         }
 
         internal bool Success { get; }
@@ -537,8 +564,33 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
 
         internal Digest? Digest { get; }
 
-        internal static CallOutcome Succeeded(string endpoint, string content, Digest digest, int promptChars) =>
-            new(true, LlmFailureKind.None, null, endpoint, content, promptChars, content.Length, digest);
+        /// <summary>本轮提取出的行动项；失败时恒为空列表，不会残留半成品。</summary>
+        internal IReadOnlyList<ActionItem> ActionItems { get; }
+
+        internal static CallOutcome Succeeded(
+            string endpoint,
+            string content,
+            DigestMapping mapping,
+            int promptChars)
+        {
+            ArgumentNullException.ThrowIfNull(mapping);
+
+            // 映射器最多给一个行动项；没有就给空列表，消费点不必判空。
+            var actionItems = mapping.ActionItem is { } action
+                ? new[] { action }
+                : Array.Empty<ActionItem>();
+
+            return new CallOutcome(
+                true,
+                LlmFailureKind.None,
+                null,
+                endpoint,
+                content,
+                promptChars,
+                content.Length,
+                mapping.Digest,
+                actionItems);
+        }
 
         internal static CallOutcome Failed(
             string endpoint,
@@ -546,19 +598,26 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
             string message,
             int promptChars,
             int completionChars = 0) =>
-            new(false, kind, message, endpoint, string.Empty, promptChars, completionChars, null);
+            new(false, kind, message, endpoint, string.Empty, promptChars, completionChars, null, Array.Empty<ActionItem>());
 
         /// <summary>
         /// 转成 Core 的调用结果。<c>RawResponse</c> 成功时是模型原文，
         /// 失败时写入归一化后的失败原因（<c>LlmResult</c> 目前没有单独的错误字段）。
         /// </summary>
         internal LlmResult ToLlmResult() => Success
-            ? new LlmResult { IsSuccess = true, RawResponse = Content, Digest = Digest }
+            ? new LlmResult
+            {
+                IsSuccess = true,
+                RawResponse = Content,
+                Digest = Digest,
+                ActionItems = ActionItems,
+            }
             : new LlmResult
             {
                 IsSuccess = false,
                 RawResponse = LlmCallRecord.ComposeError(FailureKind, ErrorMessage ?? string.Empty),
                 Digest = null,
+                ActionItems = Array.Empty<ActionItem>(),
             };
     }
 }

@@ -32,9 +32,9 @@ public sealed class SettingsPageSecurityTests
     [Fact]
     public void ValidateEnforcesTransportPolicyForRemoteEndpoints()
     {
-        var source = ReadSettingsViewModelSource();
+        var source = RepositorySourceFile.Read(SettingsViewModelRelativePath);
 
-        var validateBody = ExtractMethodBody(source, "public IReadOnlyList<string> Validate()");
+        var validateBody = RepositorySourceFile.ExtractMethodBody(source, "public IReadOnlyList<string> Validate()");
         Assert.False(
             string.IsNullOrEmpty(validateBody),
             "SettingsViewModel.cs 中找不到 Validate() 方法体，无法核对传输策略校验。");
@@ -53,68 +53,5 @@ public sealed class SettingsPageSecurityTests
         Assert.True(
             Regex.IsMatch(validateBody!, @"远程端点必须使用\s*HTTPS"),
             "Validate() 缺少“远程端点必须使用 HTTPS”错误描述。");
-    }
-
-    /// <summary>
-    /// 读取 <c>SettingsViewModel.cs</c> 源码；找不到仓库根或文件时直接失败。
-    /// </summary>
-    /// <returns>源码全文。</returns>
-    private static string ReadSettingsViewModelSource()
-    {
-        var root = RepositoryRootLocator.Find();
-        Assert.True(
-            root is not null,
-            "未能从测试输出目录向上找到仓库根目录，无法核对设置页校验。");
-
-        var sourcePath = Path.Combine(root!, SettingsViewModelRelativePath.Replace('/', Path.DirectorySeparatorChar));
-        Assert.True(File.Exists(sourcePath), $"设置页视图模型源文件不存在：{SettingsViewModelRelativePath}");
-
-        return File.ReadAllText(sourcePath);
-    }
-
-    /// <summary>
-    /// 从源码中切出以指定签名起始的方法体（按大括号配对）。
-    /// </summary>
-    /// <remarks>
-    /// 只用于本文件的快照断言：方法体内插值字符串（如 <c>$"... {MinPort} ..."</c>）
-    /// 的大括号是配对的，不会干扰配对计数。
-    /// </remarks>
-    /// <param name="source">源码全文。</param>
-    /// <param name="signature">方法签名（在文件中唯一）。</param>
-    /// <returns>方法体（不含签名与最外层大括号）；找不到时返回 <see langword="null"/>。</returns>
-    private static string? ExtractMethodBody(string source, string signature)
-    {
-        var signatureIndex = source.IndexOf(signature, StringComparison.Ordinal);
-        if (signatureIndex < 0)
-        {
-            return null;
-        }
-
-        var openIndex = source.IndexOf('{', signatureIndex);
-        if (openIndex < 0)
-        {
-            return null;
-        }
-
-        var depth = 0;
-        for (var i = openIndex; i < source.Length; i++)
-        {
-            switch (source[i])
-            {
-                case '{':
-                    depth++;
-                    break;
-                case '}':
-                    depth--;
-                    if (depth == 0)
-                    {
-                        return source[(openIndex + 1)..i];
-                    }
-
-                    break;
-            }
-        }
-
-        return null;
     }
 }
