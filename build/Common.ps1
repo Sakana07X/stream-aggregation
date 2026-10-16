@@ -67,6 +67,37 @@ $script:SelfContainedRuntimeFiles = @(
     'System.Data.Common.dll'
 )
 
+# =============================================================================
+# PINNED RELEASE LAYOUT
+#
+# The extracted package shows exactly two entries:
+#
+#   <release>/
+#     launcher.bat      <- the only file allowed at the root
+#     app/              <- the entire application payload
+#
+# The payload MUST live in one subdirectory, not be scattered across sibling
+# folders and not sit at the root. That is not a cosmetic choice; it is the
+# only arrangement measured to produce a visible window:
+#
+#   - The CLR probes the app host directory for dependencies, so a dependency
+#     placed next to the exe but outside its own directory is never found.
+#   - Win32 side-by-side resolves the embedded application manifest against the
+#     exe directory, so the WinAppSDK bootstrap fails to initialise if its
+#     payload is not there.
+#   - WinRT activation resolves against the process directory.
+#
+# With the payload spread out, CreateProcess still succeeds: the process runs,
+# reports Responding = True, owns a window handle, and never draws anything
+# (a ghost process). See build/smoke-release.ps1 for the regression net.
+# =============================================================================
+
+# Single subdirectory that holds the whole payload.
+$script:PayloadDir = 'app'
+
+# The one file allowed at the release root. Ships as build/launcher.bat.
+$script:LauncherName = 'launcher.bat'
+
 # Fixed location of the publishable project, relative to the repo root.
 $script:AppProjectRelativePath = 'src\StreamingAggregation.App\StreamingAggregation.App.csproj'
 
@@ -79,6 +110,10 @@ $script:AppManifestRelativePath = 'src\StreamingAggregation.App\app.manifest'
 $script:ExitOk      = 0
 $script:ExitFailure = 1
 $script:ExitUsage   = 2
+# 'Checked but not checkable' -- a precondition was absent, so no verdict was
+# reached. Distinct from both pass and fail on purpose: a skipped check must
+# never be mistaken for a green one.
+$script:ExitSkipped = 3
 
 # =============================================================================
 # CONSOLE / LOGGING
@@ -148,6 +183,185 @@ function Get-DeclaredAssemblyVersion {
     return $m.Groups[1].Value
 }
 
+# =============================================================================
+# RELEASE LAYOUT HELPERS
+# Every path assertion in the pipeline is written against the payload
+# directory, so the 'app\' prefix is expressed in exactly one place.
+# =============================================================================
+
+function Get-PayloadDirPath {
+    # <release>\app
+    param([string]$ReleaseDir)
+    return (Join-Path $ReleaseDir $script:PayloadDir)
+}
+
+function Get-LauncherPath {
+    # <release>\launcher.bat
+    param([string]$ReleaseDir)
+    return (Join-Path $ReleaseDir $script:LauncherName)
+}
+
+function Get-MainExePath {
+    # <release>\app\<Main>.exe -- where the executable actually lives.
+    param([string]$ReleaseDir)
+    return (Join-Path (Get-PayloadDirPath -ReleaseDir $ReleaseDir) (Get-MainExeName))
+}
+
+function Get-PayloadRelativePath {
+    # Turns a payload-relative posix path into a release-root-relative one.
+    param([string]$PayloadRelativePath)
+    return "$($script:PayloadDir)/$PayloadRelativePath"
+}
+
+function Get-ReleaseRootEntries {
+    # Direct children of the release root, split into files and directories.
+    param([string]$ReleaseDir)
+    $items = @(Get-ChildItem -LiteralPath $ReleaseDir -Force)
+    return [pscustomobject]@{
+        Files = @($items | Where-Object { -not $_.PSIsContainer } | ForEach-Object { $_.Name })
+        Dirs  = @($items | Where-Object { $_.PSIsContainer } | ForEach-Object { $_.Name })
+    }
+}
+
+# Fail-closed check of the user-visible package layout: the release root holds
+# the launcher and nothing else, and the payload lives in one subdirectory.
+#
+# This is the check that encodes the point of the layout: a user who unzips
+# the package should see two entries, not a hundred and forty-three. It also
+# catches the failure the payload-in-one-subdirectory rule exists to prevent,
+# namely a payload that leaked back to the root, which starts but never draws
+# a window.
+function Assert-ReleaseRootLayout {
+    param([string]$ReleaseDir)
+
+    $entries = Get-ReleaseRootEntries -ReleaseDir $ReleaseDir
+    $problems = New-Object System.Collections.Generic.List[string]
+
+    $expectedDirs = @($script:PayloadDir)
+    foreach ($dir in $entries.Dirs) {
+        if ($expectedDirs -notcontains $dir) {
+            $problems.Add("unexpected directory at the release root: $dir/")
+        }
+    }
+    foreach ($want in $expectedDirs) {
+        if ($entries.Dirs -notcontains $want) {
+            $problems.Add("payload directory is missing from the release root: $want/")
+        }
+    }
+
+    foreach ($file in $entries.Files) {
+        if ($file -cne $script:LauncherName) {
+            $problems.Add("unexpected file at the release root: $file (only $($script:LauncherName) is allowed there)")
+        }
+    }
+    if ($entries.Files -notcontains $script:LauncherName) {
+        $problems.Add("launcher is missing from the release root: $($script:LauncherName)")
+    }
+
+    if ($problems.Count -gt 0) {
+        # Cap the listing. A flat payload produces one problem per file, and a
+        # hundred identical-looking lines tell the reader nothing that the
+        # count and the first few names do not already say.
+        $shown = 12
+        $head = @($problems | Select-Object -First $shown)
+        $tail = ''
+        if ($problems.Count -gt $shown) {
+            $tail = "`n    ... and $($problems.Count - $shown) more"
+        }
+        throw ("Release root layout is wrong, {0} problem(s):`n    {1}{2}" -f `
+            $problems.Count, ($head -join "`n    "), $tail)
+    }
+    return $entries
+}
+
+function Install-Launcher {
+    # Copies build/launcher.bat into the release root with its line endings
+    # pinned to CRLF.
+    #
+    # Deliberately not a plain file copy. git rewrites line endings on checkout
+    # according to core.autocrlf, which is a per-machine setting; the launcher
+    # ships inside the archive, so whatever the working tree happens to hold
+    # leaks straight into the ZIP hash and two builds of one commit stop being
+    # byte-identical. Normalising here makes the BUILD own those bytes rather
+    # than git. CRLF is also what cmd.exe expects from a .bat.
+    #
+    # ASCIIEncoding throws on any non-ASCII character. Assert-LauncherContract
+    # has already rejected those, so this is a second, independent gate rather
+    # than a lossy conversion.
+    param([string]$SourcePath, [string]$DestinationPath)
+
+    $text = [System.IO.File]::ReadAllText($SourcePath)
+    # Normalise to bare LF first: a CRLF source must not become CR CR LF.
+    $text = $text -replace "`r`n", "`n"
+    $text = $text -replace "`r", "`n"
+
+    # Drop the trailing blank element. Splitting "a\nb\n" yields a final empty
+    # string, and appending CRLF to that writes a blank line every run -- which
+    # would make each build's launcher two bytes larger than the last and break
+    # byte reproducibility in a way that is very hard to see.
+    $lineList = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($text -split "`n")) { $lineList.Add($line) }
+    while ($lineList.Count -gt 0 -and $lineList[$lineList.Count - 1] -eq '') {
+        $lineList.RemoveAt($lineList.Count - 1)
+    }
+
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($line in $lineList) {
+        [void]$builder.Append($line)
+        [void]$builder.Append("`r`n")
+    }
+    [System.IO.File]::WriteAllText($DestinationPath, $builder.ToString(),
+                                   (New-Object System.Text.ASCIIEncoding))
+
+    # Carry the source timestamp across, for the same reason Copy-ReleaseWhitelist
+    # does: make-zip stores each entry's mtime, so a launcher stamped with the
+    # build clock makes every archive unique.
+    [System.IO.File]::SetLastWriteTimeUtc($DestinationPath,
+                                          [System.IO.File]::GetLastWriteTimeUtc($SourcePath))
+}
+
+# Fail-closed check that build/launcher.bat still launches the pinned exe out
+# of the pinned subdirectory.
+#
+# launcher.bat is a static file while $script:MainAssemblyName and
+# $script:PayloadDir are variables, so renaming the assembly or the payload
+# directory would silently leave a launcher that starts nothing. Nothing else
+# in the build would notice: the payload is present, the allow-list is
+# satisfied, the archive is clean. This is the only place that knows the
+# launcher is a link and not just another file.
+function Assert-LauncherContract {
+    param([string]$RepoRootPath = (Get-RepoRoot))
+
+    $launcherSource = Join-Path (Join-Path $RepoRootPath 'build') $script:LauncherName
+    if (-not (Test-Path -LiteralPath $launcherSource -PathType Leaf)) {
+        throw "Launcher source not found: $launcherSource"
+    }
+
+    # Read as bytes and fail on a BOM or any non-ASCII byte: cmd.exe decodes a
+    # .bat in the console code page, so either would corrupt it on a machine
+    # whose code page differs from the author's.
+    $bytes = [System.IO.File]::ReadAllBytes($launcherSource)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        throw "$($script:LauncherName) starts with a UTF-8 BOM; cmd.exe will try to execute it."
+    }
+    foreach ($b in $bytes) {
+        if ($b -gt 127) {
+            throw ("{0} contains a non-ASCII byte (0x{1:X2}); cmd.exe reads .bat files in the console code page. Keep it ASCII." -f $script:LauncherName, $b)
+        }
+    }
+
+    $text = [System.IO.File]::ReadAllText($launcherSource)
+    $expectedDirRef = "$($script:PayloadDir)\"
+    if ($text -notmatch [regex]::Escape($expectedDirRef)) {
+        throw ("{0} does not reference the payload directory '{1}'. The release layout is pinned to <root>/{1}/<payload>." -f $script:LauncherName, $expectedDirRef)
+    }
+    $exeName = Get-MainExeName
+    if ($text -notmatch [regex]::Escape($exeName)) {
+        throw ("{0} does not reference '$exeName'. Regenerate it if $script:MainAssemblyName changed." -f $script:LauncherName)
+    }
+    return $launcherSource
+}
+
 # Fail-closed check that the release will actually start.
 #
 # The application manifest is embedded in the executable verbatim. Win32
@@ -206,7 +420,7 @@ function Get-DeploymentShape {
     param([string]$ReleaseDir)
 
     $rcName = "$($script:MainAssemblyName).runtimeconfig.json"
-    $rcPath = Join-Path $ReleaseDir $rcName
+    $rcPath = Join-Path (Get-PayloadDirPath -ReleaseDir $ReleaseDir) $rcName
     if (-not (Test-Path -LiteralPath $rcPath -PathType Leaf)) {
         throw "Runtime metadata not found: $rcPath"
     }

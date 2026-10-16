@@ -19,6 +19,19 @@ public sealed partial class MainWindow : Window
     private readonly AppShell _shell;
     private readonly Stack<Page> _history = new();
 
+    /// <summary>初始窗口宽度（物理像素）</summary>
+    /// <remarks>
+    /// WinUI 3 的 <see cref="Window"/> 没有 <c>Width</c>/<c>Height</c> 属性。把它们写进
+    /// XAML 会被 XAML 编译器判为 WMC0011「Unknown member」而终止编译——而且 1.7 版
+    /// 编译器在独立进程模式下会把错误吞掉，只留下一个退出码 1。因此初始尺寸只能运行时
+    /// 经 <see cref="Window.AppWindow"/> 设置。
+    /// </remarks>
+    private const int InitialWindowWidth = 1100;
+
+    /// <summary>初始窗口高度（物理像素）</summary>
+    /// <inheritdoc cref="InitialWindowWidth" path="/remarks"/>
+    private const int InitialWindowHeight = 720;
+
     /// <summary>
     /// 创建主窗口。
     /// </summary>
@@ -32,6 +45,7 @@ public sealed partial class MainWindow : Window
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(AppTitleBar);
         InitializeComponent();
+        ApplyInitialWindowSize();
 
         StatusText.Text = BuildStatusText();
         _shell.ConnectionStatus.PropertyChanged += OnConnectionStatusChanged;
@@ -40,8 +54,17 @@ public sealed partial class MainWindow : Window
 
     private void NavView_Loaded(object sender, RoutedEventArgs e)
     {
-        Navigate(typeof(Pages.DigestPage), pushHistory: false);
-        NavView.SelectedItem = NavView.MenuItems[0];
+        if (_shell.FirstRun.IsFirstRun)
+        {
+            // 首次运行：显示欢迎遮罩层，不自动跳转，等用户选择「开始配置」或「稍后再说」。
+            WelcomeOverlay.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            WelcomeOverlay.Visibility = Visibility.Collapsed;
+            Navigate(typeof(Pages.DigestPage), pushHistory: false);
+            NavView.SelectedItem = NavView.MenuItems[0];
+        }
     }
 
     private void NavView_SelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
@@ -74,6 +97,26 @@ public sealed partial class MainWindow : Window
         UpdateBackButton();
     }
 
+    /// <summary>
+    /// 「开始配置」：隐藏遮罩层并跳转到设置页。
+    /// </summary>
+    private void StartConfigButton_Click(object sender, RoutedEventArgs e)
+    {
+        WelcomeOverlay.Visibility = Visibility.Collapsed;
+        NavView.SelectedItem = NavView.MenuItems[3]; // 设置页
+    }
+
+    /// <summary>
+    /// 「稍后再说」：隐藏遮罩层、持久化标记（二次启动不再弹），并跳转到摘要页。
+    /// </summary>
+    private void LaterButton_Click(object sender, RoutedEventArgs e)
+    {
+        WelcomeOverlay.Visibility = Visibility.Collapsed;
+        _ = _shell.FirstRun.DismissAsync();
+        Navigate(typeof(Pages.DigestPage), pushHistory: false);
+        NavView.SelectedItem = NavView.MenuItems[0];
+    }
+
     /// <summary>构造并显示目标页面。</summary>
     /// <param name="pageType">页面类型。</param>
     /// <param name="pushHistory">是否把当前页面压入返回栈。</param>
@@ -89,6 +132,16 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>按返回栈深度刷新"返回"按钮的可用状态。</summary>
+    private void ApplyInitialWindowSize()
+    {
+        if (AppWindow is not { } appWindow)
+        {
+            return;
+        }
+
+        appWindow.Resize(new Windows.Graphics.SizeInt32(InitialWindowWidth, InitialWindowHeight));
+    }
+
     private void UpdateBackButton() => NavView.IsBackEnabled = _history.Count > 0;
 
     /// <summary>拼接状态条文本：状态详情 + 已连接时长。</summary>

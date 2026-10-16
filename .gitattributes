@@ -1,0 +1,10 @@
+# Line endings are pinned only where they affect a shipped artifact.
+
+# build\launcher.bat ships inside the release archive. Without a rule here, git
+# rewrites its line endings on checkout according to the per-machine
+# core.autocrlf, so two clones of the same commit could pack different bytes
+# into the ZIP. CRLF is also what cmd.exe expects from a .bat.
+#
+# Scoped to *.bat on purpose: nothing else in this repository lands inside an
+# artifact, and pinning .ps1 would force a repo-wide reformat for no gain.
+*.bat text eol=crlf

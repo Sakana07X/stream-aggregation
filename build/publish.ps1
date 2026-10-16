@@ -13,6 +13,13 @@
 #
 # Layout produced:
 #   <OutputRoot>/<version>/win-x64/          <- the release directory
+#     launcher.bat                           <- the only entry at the root
+#     app/                                   <- the entire application payload
+#
+# The payload is moved into a single 'app\' subdirectory after the allow-list
+# has been applied. That is not cosmetic: an unzipped package then shows two
+# entries instead of 143, and the app host, the Win32 side-by-side loader and
+# WinRT activation all resolve against the directory the exe actually sits in.
 #
 # The directory is built by copying an EXPLICIT ALLOW-LIST out of the raw
 # `dotnet publish` staging folder. This is deliberately not a deny-list: a new
@@ -97,7 +104,7 @@ $DropHints = @(
     @{ Pattern = '\.txt$';                                     Label = 'text note' }
 )
 
-# Files that must be present in the release directory, in BOTH deployment modes.
+# Files that must be present in the release payload, in BOTH deployment modes.
 # Fail-closed check: it catches a runtime dependency silently lost to an
 # over-eager filter rule.
 #
@@ -110,7 +117,11 @@ $DropHints = @(
 #   Microsoft.ui.xaml.dll     comes from the self-contained Windows App SDK payload
 #   WebView2Loader.dll        native asset of the Windows App SDK
 #   NpuDetect/NPUDetect.dll   native asset of the Windows App SDK
-$RequiredFiles = @(
+#
+# These paths are relative to the PAYLOAD directory, not to the release root.
+# $RequiredFiles below re-bases them onto the root so that every assertion in
+# this script speaks in release-root-relative paths.
+$RequiredPayloadFiles = @(
     'StreamingAggregation.App.exe'
     'StreamingAggregation.App.dll'
     'StreamingAggregation.Core.dll'
@@ -140,6 +151,11 @@ $RequiredFiles = @(
     'H.NotifyIcon.WinUI.dll'
     'resources.pri'
     'NpuDetect/NPUDetect.dll'
+)
+
+# The same list, relative to the release root.
+$RequiredFiles = @(
+    foreach ($rel in $RequiredPayloadFiles) { Get-PayloadRelativePath -PayloadRelativePath $rel }
 )
 
 # The .NET runtime-pack files (coreclr.dll, hostfxr.dll, hostpolicy.dll,
@@ -246,6 +262,12 @@ function Copy-ReleaseWhitelist {
             [void](New-Item -ItemType Directory -Path $destDir -Force)
         }
         [System.IO.File]::Copy($file.FullName, $dest, $true)
+        # Copy stamps the destination with the CURRENT time, which would make
+        # the release tree a record of when the build ran rather than what it
+        # built. make-zip stores each entry's mtime, so two runs over the same
+        # staging directory would produce two different archives. Carry the
+        # source timestamp across instead.
+        [System.IO.File]::SetLastWriteTimeUtc($dest, $file.LastWriteTimeUtc)
         $copiedBytes += $file.Length
         $kept++
     }
@@ -269,11 +291,71 @@ function Copy-ReleaseWhitelist {
     }
 }
 
-function Assert-RequiredFiles {
-    # Two-sided check.
+function Move-PayloadIntoSubdirectory {
+    # Moves everything the allow-list just copied into <ReleaseDir>\app\ and
+    # puts the launcher at the root.
     #
-    #   existence : everything in $RequiredFiles must be there. Catches a
-    #               dependency silently lost to an over-eager filter rule.
+    # Runs AFTER Copy-ReleaseWhitelist on purpose: the allow-list keeps
+    # matching staging-relative paths, so its rules stay exactly as audited,
+    # and the only thing this step decides is WHERE the accepted files land.
+    # A move (not a re-copy) means the bytes and timestamps are the ones the
+    # allow-list already accepted.
+    #
+    # Order is deterministic -- sorted by name -- so two runs over an unchanged
+    # staging directory produce an identical tree.
+    param([string]$ReleaseDir, [string]$LauncherSourcePath)
+
+    $payloadDir = Get-PayloadDirPath -ReleaseDir $ReleaseDir
+
+    # Snapshot the root BEFORE the payload directory exists. Enumerating after
+    # creating it would put 'app' into its own move list, and Move-Item refuses
+    # to move a directory into itself. Snapshotting first also makes the move
+    # order independent of when the payload directory appears.
+    $items = @(Get-ChildItem -LiteralPath $ReleaseDir -Force |
+               Where-Object { $_.FullName -ne $payloadDir } |
+               Sort-Object Name)
+
+    if (-not (Test-Path -LiteralPath $payloadDir -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $payloadDir -Force)
+    }
+
+    # Everything in the snapshot belongs to the payload. The launcher is not
+    # there yet, so there is nothing to exclude.
+    $movedFiles = 0
+    $movedDirs = 0
+    foreach ($item in $items) {
+        $dest = Join-Path $payloadDir $item.Name
+        if (Test-Path -LiteralPath $dest) {
+            throw ("Refusing to move '{0}': '{1}' already exists." -f $item.Name, $dest)
+        }
+        # -ErrorAction Stop: a failed move must fail the build. Left as a
+        # non-terminating error it would print a red line, carry on, and leave a
+        # payload the layout assertion then has to guess about.
+        Move-Item -LiteralPath $item.FullName -Destination $dest -ErrorAction Stop
+        if ($item.PSIsContainer) { $movedDirs++ } else { $movedFiles++ }
+    }
+
+    # Written, not copied: the build pins the line endings so the shipped
+    # bytes do not depend on the checkout's core.autocrlf. build/launcher.bat
+    # itself stays in the repository so the next run -- including
+    # -SkipPublish -- still has its input.
+    Install-Launcher -SourcePath $LauncherSourcePath `
+        -DestinationPath (Get-LauncherPath -ReleaseDir $ReleaseDir)
+
+    return [pscustomobject]@{
+        MovedFiles    = $movedFiles
+        MovedDirs     = $movedDirs
+        PayloadDir    = $payloadDir
+        LauncherPath  = (Get-LauncherPath -ReleaseDir $ReleaseDir)
+    }
+}
+
+function Assert-RequiredFiles {
+    # Two-sided check, both halves expressed in release-root-relative paths.
+    #
+    #   existence : everything in $RequiredFiles ('app/...') must be there.
+    #               Catches a dependency silently lost to an over-eager filter
+    #               rule.
     #   absence   : in framework-dependent mode nothing in
     #               $script:SelfContainedRuntimeFiles may be there. Their
     #               presence means the deployment switch did not take effect
@@ -282,6 +364,12 @@ function Assert-RequiredFiles {
     # The absence half matters because the failure it catches is otherwise
     # silent: a self-contained package built from a framework-dependent command
     # line looks complete, scans clean, and is simply 80 MB too big.
+    #
+    # Each absence check runs against BOTH the payload directory and the release
+    # root. The runtime files have to be absent from the payload to not ship;
+    # a stray copy at the root would mean something bypassed the payload move
+    # entirely, which is exactly the bug this layout change is meant to make
+    # impossible.
     param([string]$ReleaseDir, [string]$ExpectedMode = '')
 
     if ([string]::IsNullOrEmpty($ExpectedMode)) { $ExpectedMode = $script:DeploymentMode }
@@ -294,16 +382,19 @@ function Assert-RequiredFiles {
         }
     }
     if ($missing.Count -gt 0) {
-        throw ("Release directory is incomplete, {0} required file(s) missing:`n    {1}" -f `
+        throw ("Release payload is incomplete, {0} required file(s) missing:`n    {1}" -f `
             $missing.Count, ($missing -join "`n    "))
     }
 
     $unexpected = New-Object System.Collections.Generic.List[string]
     if ($ExpectedMode -ne 'SelfContained') {
         foreach ($rel in $script:SelfContainedRuntimeFiles) {
-            $path = Join-Path $ReleaseDir ($rel -replace '/', '\')
-            if (Test-Path -LiteralPath $path -PathType Leaf) {
-                $unexpected.Add($rel)
+            foreach ($root in @((Get-PayloadDirPath -ReleaseDir $ReleaseDir), $ReleaseDir)) {
+                $path = Join-Path $root $rel
+                if (Test-Path -LiteralPath $path -PathType Leaf) {
+                    $where = Get-RelativePath -BasePath $ReleaseDir -FullName $path
+                    $unexpected.Add($where)
+                }
             }
         }
         if ($unexpected.Count -gt 0) {
@@ -403,6 +494,12 @@ try {
     $manifestVersion = Assert-ManifestIdentity -RepoRootPath $repoRoot
     Write-Info "assemblyIdentity version $manifestVersion (four-part, matches Version.props)"
 
+    # The launcher is a static file pointing at a variable exe name and a
+    # variable payload directory. Nothing else would notice if the two drifted.
+    Write-Step "Checking launcher contract"
+    $launcherSource = Assert-LauncherContract -RepoRootPath $repoRoot
+    Write-Info ("{0} is ASCII and launches $($script:PayloadDir)\$(Get-MainExeName)" -f $script:LauncherName)
+
     # Only wipe the staging folder when this run actually publishes into it:
     # -SkipPublish means "reuse what is already there".
     if (-not $SkipPublish) {
@@ -430,6 +527,21 @@ try {
     Write-Host ("    kept {0} file(s) ({1}); dropped {2} file(s) and {3} directory(ies)" -f `
         $result.Kept, (Format-Bytes $result.CopiedBytes), $result.Dropped, $result.DroppedDirs)
 
+    # Everything the allow-list accepted now goes into one subdirectory, and
+    # the launcher takes the root. This is what makes an unzipped package show
+    # two entries instead of the full payload listing.
+    Write-Step "Moving the payload into '$($script:PayloadDir)\' and installing the launcher"
+    $moved = Move-PayloadIntoSubdirectory -ReleaseDir $releaseDir -LauncherSourcePath $launcherSource
+    Write-Host ("    moved {0} file(s) and {1} directory(ies) into {2}" -f `
+        $moved.MovedFiles, $moved.MovedDirs, $script:PayloadDir)
+    Write-Host ("    launcher: {0}" -f $moved.LauncherPath)
+
+    Write-Step "Verifying release root layout"
+    $rootEntries = Assert-ReleaseRootLayout -ReleaseDir $releaseDir
+    Write-Host ("    root holds exactly {0} file(s) ({1}) and {2} directory(ies) ({3})" -f `
+        $rootEntries.Files.Count, ($rootEntries.Files -join ', '),
+        $rootEntries.Dirs.Count, ($rootEntries.Dirs -join ', '))
+
     Write-Step "Verifying deployment shape"
     $shape = Assert-DeploymentShape -ReleaseDir $releaseDir
     Write-Host ("    {0} (Microsoft.NETCore.App {1})" -f $shape.Shape, $shape.FrameworkVersion)
@@ -451,7 +563,9 @@ try {
 
     $stats = Get-DirectoryStats -Path $releaseDir
     Write-Step "Release directory ready"
-    Write-Host ("    path:      $releaseDir")
+    Write-Host ("    path:      {0}" -f $releaseDir)
+    Write-Host ("    root:      {0} + {1}\ ({2} file(s) total)" -f `
+        $script:LauncherName, $script:PayloadDir, $stats.FileCount)
     Write-Host ("    files:     {0}" -f $stats.FileCount)
     Write-Host ("    folders:   {0}" -f $stats.DirCount)
     Write-Host ("    size:      {0} ({1:N0} bytes)" -f (Format-Bytes $stats.Bytes), $stats.Bytes)

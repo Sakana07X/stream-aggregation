@@ -52,6 +52,18 @@ public sealed class SettingsStore : ISettingsStore
             updated_at                 = excluded.updated_at;
         """;
 
+    private const string SelectExistsSql = """
+        SELECT EXISTS(SELECT 1 FROM app_settings);
+        """;
+
+    // 只更新 welcome_dismissed 列，其余列保持不变（包括已有行与新建行两种情况）。
+    // updated_at 是 NOT NULL 且无默认值，新建行时必须显式提供。
+    private const string MarkWelcomeDismissedSql = """
+        INSERT INTO app_settings (id, welcome_dismissed, updated_at)
+        VALUES (1, 1, $updated_at)
+        ON CONFLICT(id) DO UPDATE SET welcome_dismissed = 1;
+        """;
+
     private readonly ISqliteConnectionFactory _connectionFactory;
     private readonly ISecretStore? _secretStore;
     private readonly IClock _clock;
@@ -142,6 +154,28 @@ public sealed class SettingsStore : ISettingsStore
             .Bind("$aggregation_retention_days", settings.Aggregation.RetentionDays)
             .Bind("$group_whitelist", SqliteCommandExtensions.ToJsonArray(settings.GroupWhitelist.GroupIds ?? []))
             .Bind("$updated_at", SqliteTime.ToStorage(_clock.Now));
+
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> HasStoredSettingsAsync(CancellationToken cancellationToken = default)
+    {
+        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = SelectExistsSql;
+
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return Convert.ToInt64(result, System.Globalization.CultureInfo.InvariantCulture) == 1;
+    }
+
+    /// <inheritdoc />
+    public async Task MarkWelcomeDismissedAsync(CancellationToken cancellationToken = default)
+    {
+        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = MarkWelcomeDismissedSql;
+        command.Bind("$updated_at", SqliteTime.ToStorage(_clock.Now));
 
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }

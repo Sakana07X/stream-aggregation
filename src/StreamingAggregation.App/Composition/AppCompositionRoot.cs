@@ -98,6 +98,9 @@ public sealed class AppCompositionRoot : IDisposable
     /// <summary>设置页绑定。</summary>
     public SettingsViewModel SettingsViewModel { get; private set; } = null!;
 
+    /// <summary>首启状态绑定。</summary>
+    public FirstRunState FirstRun { get; private set; } = null!;
+
     /// <summary>暂停/恢复开关，托盘与管线共用同一份状态。</summary>
     public PauseResumeService PauseResume { get; } = new();
 
@@ -331,6 +334,10 @@ public sealed class AppCompositionRoot : IDisposable
         // 设置视图模型的属性变更通知会直接驱动界面，必须在 UI 线程上装载。
         await RunOnUiAsync(SettingsViewModel.LoadAsync, cancellationToken).ConfigureAwait(false);
 
+        // 首启状态同样在 UI 线程上初始化：IsFirstRun 的变更通知会直接驱动遮罩层可见性。
+        FirstRun = new FirstRunState(settingsStore);
+        await RunOnUiAsync(FirstRun.InitializeAsync, cancellationToken).ConfigureAwait(false);
+
         var capability = _services.Resolve<ToastNotificationService>().Probe();
         Log(PipelineLogLevel.Info, $"通知通道自检结果：{capability}。");
 
@@ -445,7 +452,7 @@ public sealed class AppCompositionRoot : IDisposable
             return;
         }
 
-        var shell = new AppShell(ConnectionStatus, SettingsViewModel, CreatePage);
+        var shell = new AppShell(ConnectionStatus, SettingsViewModel, FirstRun, CreatePage);
         _mainWindow = new MainWindow(shell);
 
         _tray = new TrayIconService(

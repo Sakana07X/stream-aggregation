@@ -36,5 +36,61 @@
                 <Frame x:Name="ContentFrame" Grid.Row="1" Padding="12,0,12,0" />
             </Grid>
         </NavigationView>
+
+        <!-- 首启遮罩层：覆盖整个窗口（含标题栏区域），首次运行时显示 -->
+        <Grid x:Name="WelcomeOverlay"
+              Background="{ThemeResource ApplicationPageBackgroundThemeBrush}"
+              Visibility="Collapsed">
+            <StackPanel VerticalAlignment="Center"
+                        HorizontalAlignment="Center"
+                        MaxWidth="560">
+                <TextBlock Text="欢迎使用流式聚合"
+                           Style="{ThemeResource TitleTextBlockStyle}"
+                           HorizontalAlignment="Center"
+                           FontSize="28"
+                           FontWeight="SemiBold"
+                           Margin="0,0,0,24" />
+
+                <TextBlock Text="完成以下三步，即可开始接收群消息摘要："
+                           Style="{ThemeResource BodyTextBlockStyle}"
+                           HorizontalAlignment="Center"
+                           Opacity="0.8"
+                           Margin="0,0,0,16" />
+
+                <StackPanel Margin="0,0,0,24">
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+                        <TextBlock Text="①" FontSize="20" FontWeight="SemiBold" Margin="0,0,12,0" />
+                        <TextBlock Text="启动 SnowLuma 并开启 OneBot 正向 WS"
+                                   VerticalAlignment="Center"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+                        <TextBlock Text="②" FontSize="20" FontWeight="SemiBold" Margin="0,0,12,0" />
+                        <TextBlock Text="在设置页填写群白名单"
+                                   VerticalAlignment="Center"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="③" FontSize="20" FontWeight="SemiBold" Margin="0,0,12,0" />
+                        <TextBlock Text="填写模型 Endpoint 和 API Key"
+                                   VerticalAlignment="Center"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+                </StackPanel>
+
+                <StackPanel Orientation="Horizontal"
+                            HorizontalAlignment="Center">
+                    <Button x:Name="StartConfigButton"
+                            Content="开始配置"
+                            Click="StartConfigButton_Click"
+                            Margin="0,0,12,0" />
+                    <Button x:Name="LaterButton"
+                            Content="稍后再说"
+                            Click="LaterButton_Click" />
+                </StackPanel>
+            </StackPanel>
+        </Grid>
     </Grid>
 </Window>

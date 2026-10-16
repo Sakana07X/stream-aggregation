@@ -25,15 +25,18 @@ public sealed class AppShell
     /// </summary>
     /// <param name="connectionStatus">连接状态绑定。</param>
     /// <param name="settings">设置页绑定。</param>
+    /// <param name="firstRun">首启状态绑定。</param>
     /// <param name="pageFactory">按页面类型构造页面的工厂。</param>
     /// <exception cref="ArgumentNullException">任一参数为 <see langword="null"/>。</exception>
     public AppShell(
         ConnectionStatusViewModel connectionStatus,
         SettingsViewModel settings,
+        FirstRunState firstRun,
         Func<Type, Page> pageFactory)
     {
         ConnectionStatus = connectionStatus ?? throw new ArgumentNullException(nameof(connectionStatus));
         Settings = settings ?? throw new ArgumentNullException(nameof(settings));
+        FirstRun = firstRun ?? throw new ArgumentNullException(nameof(firstRun));
         PageFactory = pageFactory ?? throw new ArgumentNullException(nameof(pageFactory));
     }
 
@@ -42,6 +45,9 @@ public sealed class AppShell
 
     /// <summary>设置页绑定。</summary>
     public SettingsViewModel Settings { get; }
+
+    /// <summary>首启状态绑定。</summary>
+    public FirstRunState FirstRun { get; }
 
     /// <summary>按页面类型构造页面的工厂，由组合根提供。</summary>
     public Func<Type, Page> PageFactory { get; }
