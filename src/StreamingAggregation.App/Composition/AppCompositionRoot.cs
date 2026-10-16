@@ -19,7 +19,9 @@ using StreamingAggregation.Infrastructure.Aggregation;
 using StreamingAggregation.Infrastructure.Llm;
 using StreamingAggregation.Infrastructure.OneBot;
 using StreamingAggregation.Infrastructure.Persistence;
+using StreamingAggregation.Infrastructure.Pipeline;
 using StreamingAggregation.Infrastructure.Security;
+using StreamingAggregation.Infrastructure.ViewModels;
 
 namespace StreamingAggregation.App.Composition;
 
@@ -195,6 +197,8 @@ public sealed class AppCompositionRoot : IDisposable
         }
 
         _disposed = true;
+
+        PauseResume.PauseStateChanged -= OnPauseStateChanged;
 
         _tray?.Dispose();
         _tray = null;
@@ -447,7 +451,10 @@ public sealed class AppCompositionRoot : IDisposable
         _tray = new TrayIconService(
             windowProvider: () => _mainWindow,
             isPausedProvider: () => PauseResume.IsPaused,
+            togglePauseAction: PauseResume.Toggle,
             exitAction: ExitApplication);
+
+        PauseResume.PauseStateChanged += OnPauseStateChanged;
 
         ConnectionStatus.StatusChanged += OnConnectionStatusChanged;
         _tray.UpdateConnectionState(ConnectionStatus.State);
@@ -480,16 +487,30 @@ public sealed class AppCompositionRoot : IDisposable
     }
 
     /// <summary>把事件源的状态变化推给界面与托盘。</summary>
-    /// <param name="sender">事件源。</param>
+    /// <remarks>
+    /// 除状态与原因外，还要把 <see cref="ConnectionStateTracker.LastError"/> 一并带出去。
+    /// 事件源的 reason 是「第 N 次连接尝试。」这类流程文案，真正的原因只存在 tracker 里；
+    /// 不显式带上，状态栏就会显示泛化文案而把真实错误挡在门外。
+    /// 直接从 <paramref name="sender"/> 取 tracker，是同一个 <see cref="ConnectionStateTracker"/>
+    /// 实例（<c>OneBotWebSocketClient.StateChanged</c> 转发到内部 tracker），
+    /// 也就不受 <c>_eventSource</c> 何时被置空的影响。
+    /// </remarks>
+    /// <param name="sender">发出状态变化的事件源；即内部的状态跟踪器。</param>
     /// <param name="e">状态变化参数。</param>
     private void OnConnectionStateChanged(object? sender, ConnectionStateChangedEventArgs e) =>
-        ConnectionStatus.Apply(e.Current, e.Reason);
+        ConnectionStatus.Apply(e.Current, e.Reason, (sender as ConnectionStateTracker)?.LastError);
 
     /// <summary>连接状态变化后同步托盘提示文字。</summary>
     /// <param name="sender">连接状态绑定。</param>
     /// <param name="model">连接状态绑定。</param>
     private void OnConnectionStatusChanged(object? sender, ConnectionStatusViewModel model) =>
         _tray?.UpdateConnectionState(model.State);
+
+    /// <summary>暂停状态变化后同步托盘菜单文案（「暂停处理」↔「恢复处理」）。</summary>
+    /// <param name="sender">暂停/恢复服务。</param>
+    /// <param name="isPaused">当前是否处于暂停状态。</param>
+    private void OnPauseStateChanged(object? sender, bool isPaused) =>
+        _tray?.UpdatePauseState();
 
     /// <summary>设置保存后接管新设置并重连。</summary>
     /// <param name="sender">设置视图模型。</param>

@@ -17,16 +17,20 @@ public sealed class TrayIconService : IDisposable
     private readonly TaskbarIcon _trayIcon;
     private readonly Func<Window> _windowProvider;
     private readonly Func<bool> _isPausedProvider;
+    private readonly Action _togglePauseAction;
     private readonly Action _exitAction;
+    private MenuFlyoutItem _pauseItem = null!;
     private bool _disposed;
 
     public TrayIconService(
         Func<Window> windowProvider,
         Func<bool> isPausedProvider,
+        Action togglePauseAction,
         Action exitAction)
     {
         _windowProvider = windowProvider ?? throw new ArgumentNullException(nameof(windowProvider));
         _isPausedProvider = isPausedProvider ?? throw new ArgumentNullException(nameof(isPausedProvider));
+        _togglePauseAction = togglePauseAction ?? throw new ArgumentNullException(nameof(togglePauseAction));
         _exitAction = exitAction ?? throw new ArgumentNullException(nameof(exitAction));
 
         _trayIcon = new TaskbarIcon
@@ -78,13 +82,12 @@ public sealed class TrayIconService : IDisposable
             Command = new RelayCommand(ShowWindow),
         });
 
-        var pauseItem = new MenuFlyoutItem
+        _pauseItem = new MenuFlyoutItem
         {
-            Text = "暂停处理",
+            Command = new RelayCommand(_togglePauseAction),
             Tag = "PauseMenuItem",
         };
-        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(pauseItem, "暂停处理");
-        menu.Items.Add(pauseItem);
+        menu.Items.Add(_pauseItem);
 
         menu.Items.Add(new MenuFlyoutItem
         {
@@ -92,7 +95,21 @@ public sealed class TrayIconService : IDisposable
             Command = new RelayCommand(() => _exitAction()),
         });
 
+        UpdatePauseState();
+
         return menu;
+    }
+
+    /// <summary>
+    /// 按当前暂停状态刷新「暂停处理 / 恢复处理」菜单文案与无障碍名称。
+    /// </summary>
+    public void UpdatePauseState()
+    {
+        if (_disposed) return;
+
+        var text = _isPausedProvider() ? "恢复处理" : "暂停处理";
+        _pauseItem.Text = text;
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(_pauseItem, text);
     }
 
     private class RelayCommand : System.Windows.Input.ICommand
