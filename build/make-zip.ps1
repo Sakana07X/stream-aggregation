@@ -137,6 +137,20 @@ function Assert-ZipContents {
             if ($mainDirs -contains 'win-x64') {
                 $problems.Add("archive root is wrapped in an extra 'win-x64' folder")
             }
+
+            # Culture folders: only the allow-listed ones may appear, and
+            # never more of them. This mirrors the publish.ps1 allow-list.
+            $allowedCultures = @('zh-CN', 'zh-TW', 'en-us')
+            $cultureDirs = @($mainDirs | Where-Object { $_ -cmatch '^[a-z]{2,3}-[A-Za-z0-9]{2,8}(-[A-Za-z0-9]{2,8})*$' })
+            if ($cultureDirs.Count -gt $allowedCultures.Count) {
+                $problems.Add("too many culture folders in archive: $($cultureDirs -join ', ')")
+            }
+            foreach ($culture in $cultureDirs) {
+                if ($allowedCultures -notcontains $culture) {
+                    $problems.Add("culture folder not on the allow-list: $culture")
+                }
+            }
+
             Write-Info ("entries: {0} ({1} below the root)" -f $entryCount, $rootDepth)
         } finally {
             $archive.Dispose()
@@ -205,6 +219,12 @@ try {
     Write-Info ("packing {0} file(s), {1}" -f $stats.FileCount, (Format-Bytes $stats.Bytes))
 
     Write-Step "Writing ZIP (root holds the main program directly)"
+    # -OutputRoot is honoured by the usage banner but was never created, so a
+    # caller-supplied (or freshly cleaned) root made ZipFile.Open fail with
+    # "part of the path could not be found" instead of producing the archive.
+    if (-not (Test-Path -LiteralPath (Split-Path -Parent $zipPath) -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path (Split-Path -Parent $zipPath) -Force)
+    }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $fileCount = New-ReleaseZip -SourceDir $ReleaseDir -ZipPath $zipPath
     $watch.Stop()

@@ -40,6 +40,13 @@ SnowLuma → OneBot WebSocket → 流式聚合 → SQLite
 
 首版使用本地 SQLite，不修改 SnowLuma 的数据库。SnowLuma 运行数据、QQ 消息、日志、token 和模型 API Key 不应提交到仓库。Token 和 API Key 使用 Windows DPAPI 加密后保存在 `secrets.dat`，明文不落盘。
 
+## 运行前提
+
+- **操作系统**：Windows 10 1809（17763）或更高，x64
+- **.NET 运行时**：需自行安装 [.NET 10 Desktop Runtime (x64)](https://dotnet.microsoft.com/download/dotnet/10.0)
+- Windows 自带的 .NET Framework 4.x 不能替代 .NET 10 运行时
+- 缺少运行时时程序无法启动，且不会弹出自身的错误提示框
+
 ## 当前状态
 
 - 项目计划：已建立。

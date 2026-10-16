@@ -2,6 +2,8 @@
 
 流式聚合没有独立的配置文件。所有设置都在应用界面的**设置页**填写，保存在本机 SQLite 的 `app_settings` 表里；Token 和模型 API Key 例外，它们加密后单独存在 `secrets.dat`。
 
+> **运行环境要求**：需要 .NET 10 Desktop Runtime (x64)，下载地址 https://dotnet.microsoft.com/download/dotnet/10.0 。详见[使用说明](usage.md)的「关于 .NET 运行时」一节。
+
 ## 设置项
 
 ### SnowLuma 连接

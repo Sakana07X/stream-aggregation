@@ -28,8 +28,21 @@
     <!-- 让 WindowsAppSDK 的 Microsoft.WinUI.props 自动把 Assets\**\*.* 收进 Content -->
     <EnableDefaultAssets>true</EnableDefaultAssets>
     <WindowsPackageType>None</WindowsPackageType>
-    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
-    <SelfContained>true</SelfContained>
+    <!--
+      部署形态：.NET 框架依赖 + Windows App SDK 自包含。
+
+      这两个属性写的是"默认值"，不是"强制值"。MSBuild 里命令行 -p: 传进来的
+      是全局属性，全局属性会让 $(SelfContained) 非空，于是下面的 Condition 不成立、
+      赋值被跳过。若不加 Condition，属性就变成硬编码，build/publish.ps1 的
+      -p:SelfContained=false 会被无声覆盖，发布形态与脚本声明的不符。
+      （这是真实踩过的坑：改成可覆盖形式后，脚本才真正握有发布形态的控制权。）
+
+      WindowsAppSDKSelfContained 保持 true 的原因：用户只需装一个运行时
+      （.NET Desktop Runtime），而 WinAppSDK 运行时缺失的表现是 bootstrap 静默
+      失败、没有清晰报错，比缺 .NET 难排查得多。
+    -->
+    <WindowsAppSDKSelfContained Condition="'$(WindowsAppSDKSelfContained)' == ''">true</WindowsAppSDKSelfContained>
+    <SelfContained Condition="'$(SelfContained)' == ''">false</SelfContained>
     <!-- 托盘/窗口图标占位（Assets\AppIcon.ico） -->
     <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
   </PropertyGroup>

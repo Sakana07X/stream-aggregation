@@ -2,8 +2,14 @@
 # Builds the whitelisted win-x64 release directory.
 #
 # Release shape is fixed by the handoff plan:
-#   Release + win-x64 + self-contained + full-directory publish
+#   Release + win-x64 + full-directory publish
+#   Deployment: .NET framework-dependent + self-contained Windows App SDK
 #   (no single-file merge: it has never been validated on a real machine)
+#
+# The .NET runtime is deliberately NOT bundled; the user installs .NET 10
+# Desktop Runtime (x64) once. The Windows App SDK payload IS bundled: its
+# bootstrap fails silently when the runtime is absent, which is much harder to
+# diagnose than a missing .NET runtime.
 #
 # Layout produced:
 #   <OutputRoot>/<version>/win-x64/          <- the release directory
@@ -40,19 +46,23 @@ param(
 # =============================================================================
 
 # Directories allowed directly under the release root.
-# Satellite resource folders are recognised by BCP-47 shape (language subtag
-# plus a mandatory hyphen), so 'obj' / 'bin' / 'src' / 'tests' can never
-# sneak in through the culture rule. Region and script subtags may contain
-# digits ('zh-419', 'es-419'), so the later subtags allow 0-9.
 $AllowedRootDirs   = @('Assets', 'Microsoft.UI.Xaml', 'NpuDetect')
-$CultureDirPattern = '^[a-z]{2,3}-[A-Za-z0-9]{2,8}(-[A-Za-z0-9]{2,8})*$'
+
+# Satellite resource folders, listed explicitly. The MUI path
+# '<install>\<culture>\<name>.mui' is a Windows hard convention and cannot
+# be redirected, so the only lever is which culture folders we copy. The
+# Windows App SDK ships 86 of them; we keep only what the product needs.
+# -contains is case-insensitive, so 'en-us' matches the on-disk 'en-us'.
+# Windows App SDK 1.7 only ships zh-CN / zh-TW / en-us; zh-HK does not exist,
+# so listing it here would fail the fail-closed required-file check below.
+$AllowedCultureDirs = @('zh-CN', 'zh-TW', 'en-us')
 
 # Directories allowed below the release root, as posix relative paths.
 $AllowedNestedDirs = @('Microsoft.UI.Xaml/Assets')
 
-# A folder that matched $CultureDirPattern may only contain localized resource
-# files. Without this, a stray folder such as 'obj-x64' would pass the culture
-# shape test and smuggle any allow-listed binary through.
+# A culture folder may only contain localized resource files. Without this, a
+# non-allow-listed folder that happens to look culture-shaped (e.g. 'obj-x64')
+# could smuggle any allow-listed binary through.
 $AllowedCultureExtensions = @('.mui')
 
 # File rules, matched against the relative path. First match wins.
@@ -87,8 +97,19 @@ $DropHints = @(
     @{ Pattern = '\.txt$';                                     Label = 'text note' }
 )
 
-# Files that must be present in the release directory. Fail-closed check: it
-# catches a runtime dependency silently lost to an over-eager filter rule.
+# Files that must be present in the release directory, in BOTH deployment modes.
+# Fail-closed check: it catches a runtime dependency silently lost to an
+# over-eager filter rule.
+#
+# Easy to get wrong on purpose: these four look like framework files but are
+# NOT provided by the .NET runtime and are not pruned in framework-dependent
+# mode. Deleting any of them makes the package throw DllNotFoundException from
+# inside managed code on the user's machine, which no build-time check catches:
+#
+#   e_sqlite3.dll             native asset of the SQLitePCLRaw NuGet package
+#   Microsoft.ui.xaml.dll     comes from the self-contained Windows App SDK payload
+#   WebView2Loader.dll        native asset of the Windows App SDK
+#   NpuDetect/NPUDetect.dll   native asset of the Windows App SDK
 $RequiredFiles = @(
     'StreamingAggregation.App.exe'
     'StreamingAggregation.App.dll'
@@ -97,12 +118,6 @@ $RequiredFiles = @(
     'StreamingAggregation.App.deps.json'
     'StreamingAggregation.App.runtimeconfig.json'
     'Assets/AppIcon.ico'
-    'coreclr.dll'
-    'hostfxr.dll'
-    'hostpolicy.dll'
-    'mscorlib.dll'
-    'System.Private.CoreLib.dll'
-    'System.Data.Common.dll'
     'e_sqlite3.dll'
     'Microsoft.Data.Sqlite.dll'
     'SQLitePCLRaw.core.dll'
@@ -111,6 +126,12 @@ $RequiredFiles = @(
     'Microsoft.UI.Xaml.Controls.dll'
     'Microsoft.UI.Xaml.winmd'
     'Microsoft.UI.Xaml/Assets/map.html'
+    'zh-CN/Microsoft.ui.xaml.dll.mui'
+    'zh-CN/Microsoft.UI.Xaml.Phone.dll.mui'
+    'en-us/Microsoft.ui.xaml.dll.mui'
+    'en-us/Microsoft.UI.Xaml.Phone.dll.mui'
+    'zh-TW/Microsoft.ui.xaml.dll.mui'
+    'zh-TW/Microsoft.UI.Xaml.Phone.dll.mui'
     'Microsoft.WindowsAppRuntime.Bootstrap.dll'
     'Microsoft.WindowsAppRuntime.Bootstrap.Net.dll'
     'WindowsAppRuntime.png'
@@ -120,6 +141,12 @@ $RequiredFiles = @(
     'resources.pri'
     'NpuDetect/NPUDetect.dll'
 )
+
+# The .NET runtime-pack files (coreclr.dll, hostfxr.dll, hostpolicy.dll,
+# mscorlib.dll, System.Private.CoreLib.dll, System.Data.Common.dll) are NOT
+# listed here because they must be ABSENT in the shipped shape. They live in
+# $SelfContainedRuntimeFiles in build/Common.ps1, next to $script:DeploymentMode
+# so the list and the flag it belongs to cannot drift apart.
 
 # =============================================================================
 # WHITELIST EVALUATION
@@ -132,7 +159,7 @@ function Test-AllowedDirectory {
 
     $parts = $RelDir.Split('/')
     $head = $parts[0]
-    $headOk = ($AllowedRootDirs -contains $head) -or ($head -cmatch $CultureDirPattern)
+    $headOk = ($AllowedRootDirs -contains $head) -or ($AllowedCultureDirs -contains $head)
     if (-not $headOk) { return $false }
 
     for ($i = 1; $i -lt $parts.Count; $i++) {
@@ -200,7 +227,7 @@ function Copy-ReleaseWhitelist {
 
         if ($segments.Length -gt 1) {
             $topDir = $segments[0]
-            $isCultureFolder = ($AllowedRootDirs -notcontains $topDir) -and ($topDir -cmatch $CultureDirPattern)
+            $isCultureFolder = ($AllowedRootDirs -notcontains $topDir) -and ($AllowedCultureDirs -contains $topDir)
             if ($isCultureFolder -and ($AllowedCultureExtensions -notcontains [System.IO.Path]::GetExtension($rel))) {
                 $drops.Add("$rel  -> localized resource folders may only hold $($AllowedCultureExtensions -join ', ')")
                 continue
@@ -243,7 +270,22 @@ function Copy-ReleaseWhitelist {
 }
 
 function Assert-RequiredFiles {
-    param([string]$ReleaseDir)
+    # Two-sided check.
+    #
+    #   existence : everything in $RequiredFiles must be there. Catches a
+    #               dependency silently lost to an over-eager filter rule.
+    #   absence   : in framework-dependent mode nothing in
+    #               $script:SelfContainedRuntimeFiles may be there. Their
+    #               presence means the deployment switch did not take effect
+    #               and the package is still carrying the .NET runtime pack.
+    #
+    # The absence half matters because the failure it catches is otherwise
+    # silent: a self-contained package built from a framework-dependent command
+    # line looks complete, scans clean, and is simply 80 MB too big.
+    param([string]$ReleaseDir, [string]$ExpectedMode = '')
+
+    if ([string]::IsNullOrEmpty($ExpectedMode)) { $ExpectedMode = $script:DeploymentMode }
+
     $missing = New-Object System.Collections.Generic.List[string]
     foreach ($rel in $RequiredFiles) {
         $path = Join-Path $ReleaseDir ($rel -replace '/', '\')
@@ -254,6 +296,20 @@ function Assert-RequiredFiles {
     if ($missing.Count -gt 0) {
         throw ("Release directory is incomplete, {0} required file(s) missing:`n    {1}" -f `
             $missing.Count, ($missing -join "`n    "))
+    }
+
+    $unexpected = New-Object System.Collections.Generic.List[string]
+    if ($ExpectedMode -ne 'SelfContained') {
+        foreach ($rel in $script:SelfContainedRuntimeFiles) {
+            $path = Join-Path $ReleaseDir ($rel -replace '/', '\')
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $unexpected.Add($rel)
+            }
+        }
+        if ($unexpected.Count -gt 0) {
+            throw ("Release directory is '$ExpectedMode' but still ships {0} self-contained runtime file(s):`n    {1}`n    The deployment switch did not take effect." -f `
+                $unexpected.Count, ($unexpected -join "`n    "))
+        }
     }
 }
 
@@ -269,11 +325,18 @@ function Invoke-StagePublish {
 
     # Debug symbols are switched off at the source; the whitelist would drop
     # them anyway. Belt and braces: no PDB is generated in the first place.
+    #
+    # The deployment shape is passed as -p: rather than left to the csproj.
+    # Both properties in the csproj carry a Condition="'$(..)' == ''" guard, so
+    # a command-line global property wins; without that guard the csproj value
+    # would silently override this and the build would keep its old shape.
+    # Assert-DeploymentShape reads the result back out of runtimeconfig.json.
     $dotnetArgs = @(
         'publish', $ProjectPath,
         '--configuration', $script:Configuration,
         '--runtime', $script:RuntimeIdentifier,
-        '--self-contained', 'true',
+        ('-p:SelfContained=' + $script:SelfContained),
+        ('-p:WindowsAppSDKSelfContained=' + $script:WindowsAppSdkSelfContained),
         '--output', $StageDir,
         # Parenthesised on purpose: the comma operator binds tighter than '+'
         # inside an array literal, so an unparenthesised concatenation would
@@ -287,7 +350,7 @@ function Invoke-StagePublish {
         '--verbosity', 'minimal'
     )
 
-    Write-Step "dotnet publish ($($script:Configuration) / $($script:RuntimeIdentifier) / self-contained)"
+    Write-Step "dotnet publish ($($script:Configuration) / $($script:RuntimeIdentifier) / $($script:DeploymentMode))"
     Write-Info "log: $logPath"
 
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -328,7 +391,7 @@ try {
     $releaseDir = Join-Path (Join-Path $OutputRoot $releaseVersion) $script:RuntimeIdentifier
     $projectPath = Get-AppProjectPath -RepoRootPath $repoRoot
 
-    Write-Step "Release $releaseVersion ($($script:Configuration) / $($script:RuntimeIdentifier) / self-contained)"
+    Write-Step "Release $releaseVersion ($($script:Configuration) / $($script:RuntimeIdentifier) / $($script:DeploymentMode))"
     Write-Info "repo:       $repoRoot"
     Write-Info "project:    $projectPath"
     Write-Info "stage:      $StageRoot"
@@ -367,9 +430,18 @@ try {
     Write-Host ("    kept {0} file(s) ({1}); dropped {2} file(s) and {3} directory(ies)" -f `
         $result.Kept, (Format-Bytes $result.CopiedBytes), $result.Dropped, $result.DroppedDirs)
 
+    Write-Step "Verifying deployment shape"
+    $shape = Assert-DeploymentShape -ReleaseDir $releaseDir
+    Write-Host ("    {0} (Microsoft.NETCore.App {1})" -f $shape.Shape, $shape.FrameworkVersion)
+
     Write-Step "Verifying required runtime files"
     Assert-RequiredFiles -ReleaseDir $releaseDir
-    Write-Host ("    all {0} required file(s) present" -f $RequiredFiles.Count)
+    if ($script:DeploymentMode -eq 'SelfContained') {
+        Write-Host ("    all {0} required file(s) present" -f $RequiredFiles.Count)
+    } else {
+        Write-Host ("    all {0} required file(s) present; {1} self-contained runtime file(s) correctly absent" -f `
+            $RequiredFiles.Count, $script:SelfContainedRuntimeFiles.Count)
+    }
 
     if (-not $SkipScan) {
         Invoke-SensitiveScan -RepoRootPath $repoRoot -TargetDir $releaseDir | Out-Null

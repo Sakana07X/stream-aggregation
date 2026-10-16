@@ -5,11 +5,32 @@
 | 项 | 要求 |
 | --- | --- |
 | 操作系统 | Windows 10 1809（17763）或更高，x64 |
-| .NET 运行时 | 无需单独安装，发布产物自带 |
+| .NET 运行时 | **需自行安装** .NET 10 Desktop Runtime (x64)，见下方说明 |
 | SnowLuma | 已在本机启动，且已开启 OneBot 正向 WebSocket |
 | 模型接口 | 任意 OpenAI 兼容的 `/chat/completions` 服务（可自建） |
 
 流式聚合不负责登录 QQ，也不发送 QQ 消息。它只作为客户端连接 SnowLuma 提供的 OneBot WebSocket 读取消息。
+
+### 关于 .NET 运行时
+
+本版采用**框架依赖**发布模式——.NET 10 运行时不再随应用分发，需要你单独安装一次。
+
+- 下载地址：https://dotnet.microsoft.com/download/dotnet/10.0
+- 选择 **Desktop Runtime (x64)**（不是 Base Runtime；Desktop Runtime 同时包含 NETCore 和 Desktop 组件）
+- Windows 自带的 .NET Framework 4.x 是旧技术，**不能**替代 .NET 10 运行时
+- 安装后无需重启，直接启动应用即可
+
+> **注意：缺运行时时的表现。** 如果 .NET 10 运行时未安装或版本不对，程序会在进入托管代码之前就失败——此时程序**弹不出自己的错误对话框**，你只会看到 Windows 系统错误框（或什么都没有）。遇到这种情况，请按上述地址安装 Desktop Runtime 后重试。
+
+### 关于 System.*.DLL 文件
+
+你可能注意到发布目录里有 `System.*.dll` 等文件，会以为"这根本就是 Windows 11 自带的依赖库吧"。实际情况是：
+
+- Windows 11 确实自带 .NET **Framework** 4.x，但那是 2000 年代的老技术，与现代 .NET（.NETCore.App）是完全不同的运行时。
+- 现代 .NET（.NET 5 及以上，包括 .NET 10）**不随 Windows 预装**，必须单独安装。
+- 发布目录中出现的 `System.*.dll` 来自 **Windows App SDK**（WinUI 3 的底层框架），该部分仍然是自包含的——你不需要额外安装 Windows App SDK 运行时。
+
+简单来说：**应用本体和 WinUI 3 组件随包分发，但 .NET 10 运行时要你自己装。**
 
 ## 首次配置
 

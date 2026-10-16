@@ -24,10 +24,48 @@ $script:ProductNameCodePoints = @(0x6D41, 0x5F0F, 0x805A, 0x5408)
 # host executable is <MainAssemblyName>.exe.
 $script:MainAssemblyName = 'StreamingAggregation.App'
 
-# Fixed build shape required by the handoff plan: Release + win-x64 + self-contained.
+# Fixed build shape required by the handoff plan: Release + win-x64.
 $script:Configuration      = 'Release'
 $script:RuntimeIdentifier = 'win-x64'
 $script:BuildPlatform     = 'x64'
+
+# =============================================================================
+# PINNED DEPLOYMENT SHAPE
+#
+# 'FrameworkDependent' -> .NET runtime is NOT bundled; the user installs
+#                         .NET 10 Desktop Runtime (x64) once.
+# 'SelfContained'       -> the .NET runtime IS bundled.
+#
+# This is the single source of truth. publish.ps1 passes the derived
+# -p:SelfContained / -p:WindowsAppSDKSelfContained to dotnet, and
+# Assert-DeploymentShape reads the produced runtimeconfig.json back to prove the
+# flag actually took effect. A property that is declared but never verified is
+# how a 105 MB framework-dependent build silently turns into a 186 MB
+# self-contained one.
+# =============================================================================
+
+$script:DeploymentMode = 'FrameworkDependent'
+
+# The Windows App SDK payload stays self-contained in both modes on purpose:
+# its bootstrap fails silently with no clear error when the runtime is missing,
+# which is far harder to diagnose than a missing .NET runtime (which fails
+# before managed code runs and names itself in the Windows error box).
+$script:WindowsAppSdkSelfContained = 'true'
+
+$script:SelfContained = $(if ($script:DeploymentMode -eq 'SelfContained') { 'true' } else { 'false' })
+
+# Files that only exist when $script:DeploymentMode is 'SelfContained': they are
+# the .NET runtime pack (coreclr + host + the framework's own assemblies).
+# In framework-dependent mode their presence means the switch did not take
+# effect and the package is carrying a ~80 MB runtime the user does not need.
+$script:SelfContainedRuntimeFiles = @(
+    'coreclr.dll'
+    'hostfxr.dll'
+    'hostpolicy.dll'
+    'mscorlib.dll'
+    'System.Private.CoreLib.dll'
+    'System.Data.Common.dll'
+)
 
 # Fixed location of the publishable project, relative to the repo root.
 $script:AppProjectRelativePath = 'src\StreamingAggregation.App\StreamingAggregation.App.csproj'
@@ -148,8 +186,91 @@ function Assert-ManifestIdentity {
     return $manifestVersion
 }
 
+# Fail-closed check that the release ships in the deployment shape the release
+# plan pins.
+#
+# <Main>.runtimeconfig.json is the only artifact that records what was actually
+# built, and the two shapes are mutually exclusive in it:
+#
+#   self-contained      -> runtimeOptions.includedFrameworks = [ { name, version } ]
+#   framework-dependent -> runtimeOptions.framework         = { name, version }
+#
+# Reading it back is deterministic: it needs no installed runtime, no launch,
+# no file-size heuristic. It closes the gap that lets a declared-but-ignored
+# property ship the wrong package -- if -p:SelfContained=false is dropped, or
+# the csproj hardcodes the property so the command line is overridden, the JSON
+# still says includedFrameworks and this throws.
+function Get-DeploymentShape {
+    # Returns the shape actually recorded in the release directory, plus the
+    # .NET framework version it was resolved against.
+    param([string]$ReleaseDir)
+
+    $rcName = "$($script:MainAssemblyName).runtimeconfig.json"
+    $rcPath = Join-Path $ReleaseDir $rcName
+    if (-not (Test-Path -LiteralPath $rcPath -PathType Leaf)) {
+        throw "Runtime metadata not found: $rcPath"
+    }
+
+    try {
+        $json = [System.IO.File]::ReadAllText($rcPath) | ConvertFrom-Json
+    } catch {
+        throw ("Could not parse $rcName as JSON: {0}" -f $_.Exception.Message)
+    }
+
+    $opts = $json.runtimeOptions
+    if ($null -eq $opts) {
+        throw "$rcName has no 'runtimeOptions' object; the deployment shape cannot be determined."
+    }
+
+    # PSObject.Properties is the reliable existence test here: on Windows
+    # PowerShell 5.1 a missing property silently yields $null, which would make
+    # an absent key indistinguishable from an explicit null.
+    $names = @($opts.PSObject.Properties | ForEach-Object { $_.Name })
+    $hasIncluded = ($names -contains 'includedFrameworks')
+    $hasFramework = ($names -contains 'framework')
+
+    if ($hasIncluded -and $hasFramework) {
+        throw ("$rcName declares BOTH 'includedFrameworks' and 'framework'. That is not a shape the .NET SDK produces; the file is corrupt or was hand-edited.")
+    }
+
+    $shape = 'Unknown'
+    $frameworkVersion = ''
+    if ($hasIncluded) {
+        $shape = 'SelfContained'
+        $first = @($opts.includedFrameworks)[0]
+        if ($null -ne $first) { $frameworkVersion = $first.version }
+    } elseif ($hasFramework) {
+        $shape = 'FrameworkDependent'
+        if ($null -ne $opts.framework) { $frameworkVersion = $opts.framework.version }
+    }
+
+    return [pscustomobject]@{
+        Shape            = $shape
+        FrameworkVersion = $frameworkVersion
+        RuntimeConfigPath = $rcPath
+    }
+}
+
+function Assert-DeploymentShape {
+    # Throws unless the built release matches $script:DeploymentMode.
+    param([string]$ReleaseDir, [string]$ExpectedMode = '')
+
+    if ([string]::IsNullOrEmpty($ExpectedMode)) { $ExpectedMode = $script:DeploymentMode }
+    $actual = Get-DeploymentShape -ReleaseDir $ReleaseDir
+    # NB: PowerShell interpolates a bare $variable in a double-quoted string but
+    # not its members -- "$actual.Shape" would print the literal ".Shape".
+    $shapeText = $actual.Shape
+    if ($actual.Shape -ne $ExpectedMode) {
+        throw ("Deployment shape mismatch: expected '$ExpectedMode' but $ReleaseDir is '$shapeText'." +
+               "`n    Read $($actual.RuntimeConfigPath) to see what was actually published." +
+               "`n    If the csproj property lost its Condition=""'..' == ''"" guard, -p: on the command line is silently overridden and the build keeps its old shape.")
+    }
+    return $actual
+}
+
 # Reads the single source of truth: build/Version.props -> <Version>.
 function Get-ProductVersion {
+
     param([string]$RepoRootPath = (Get-RepoRoot))
     $propsPath = Join-Path (Join-Path $RepoRootPath 'build') 'Version.props'
     if (-not (Test-Path -LiteralPath $propsPath -PathType Leaf)) {
