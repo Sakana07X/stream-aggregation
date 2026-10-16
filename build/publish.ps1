@@ -13,8 +13,12 @@
 #
 # Layout produced:
 #   <OutputRoot>/<version>/win-x64/          <- the release directory
-#     launcher.bat                           <- the only entry at the root
+#     <product name>.exe                     <- the only entry at the root
 #     app/                                   <- the entire application payload
+#
+# The launcher at the root is COMPILED here, not copied: build/launcher/
+# Launcher.cs becomes a small .NET Framework winexe with the product icon and
+# version resource linked in by rc.exe. It is the file the user double-clicks.
 #
 # The payload is moved into a single 'app\' subdirectory after the allow-list
 # has been applied. That is not cosmetic: an unzipped package then shows two
@@ -292,8 +296,14 @@ function Copy-ReleaseWhitelist {
 }
 
 function Move-PayloadIntoSubdirectory {
-    # Moves everything the allow-list just copied into <ReleaseDir>\app\ and
-    # puts the launcher at the root.
+    # Moves everything the allow-list just copied into <ReleaseDir>\app\, so
+    # that <ReleaseDir> is left holding nothing but the directory itself.
+    #
+    # The launcher is written afterwards, by Build-Launcher, as a separate
+    # step. Doing it in this function used to be a plain file copy; now it is
+    # a compile, and a compile that wants its own scratch folder, its own
+    # diagnostics and its own place in the build log does not belong inside a
+    # routine whose only job is "put these files over there".
     #
     # Runs AFTER Copy-ReleaseWhitelist on purpose: the allow-list keeps
     # matching staging-relative paths, so its rules stay exactly as audited,
@@ -303,7 +313,7 @@ function Move-PayloadIntoSubdirectory {
     #
     # Order is deterministic -- sorted by name -- so two runs over an unchanged
     # staging directory produce an identical tree.
-    param([string]$ReleaseDir, [string]$LauncherSourcePath)
+    param([string]$ReleaseDir)
 
     $payloadDir = Get-PayloadDirPath -ReleaseDir $ReleaseDir
 
@@ -319,8 +329,8 @@ function Move-PayloadIntoSubdirectory {
         [void](New-Item -ItemType Directory -Path $payloadDir -Force)
     }
 
-    # Everything in the snapshot belongs to the payload. The launcher is not
-    # there yet, so there is nothing to exclude.
+    # Everything in the snapshot belongs to the payload. The launcher has not
+    # been built yet, so there is nothing to exclude.
     $movedFiles = 0
     $movedDirs = 0
     foreach ($item in $items) {
@@ -335,18 +345,10 @@ function Move-PayloadIntoSubdirectory {
         if ($item.PSIsContainer) { $movedDirs++ } else { $movedFiles++ }
     }
 
-    # Written, not copied: the build pins the line endings so the shipped
-    # bytes do not depend on the checkout's core.autocrlf. build/launcher.bat
-    # itself stays in the repository so the next run -- including
-    # -SkipPublish -- still has its input.
-    Install-Launcher -SourcePath $LauncherSourcePath `
-        -DestinationPath (Get-LauncherPath -ReleaseDir $ReleaseDir)
-
     return [pscustomobject]@{
-        MovedFiles    = $movedFiles
-        MovedDirs     = $movedDirs
-        PayloadDir    = $payloadDir
-        LauncherPath  = (Get-LauncherPath -ReleaseDir $ReleaseDir)
+        MovedFiles   = $movedFiles
+        MovedDirs    = $movedDirs
+        PayloadDir   = $payloadDir
     }
 }
 
@@ -494,11 +496,13 @@ try {
     $manifestVersion = Assert-ManifestIdentity -RepoRootPath $repoRoot
     Write-Info "assemblyIdentity version $manifestVersion (four-part, matches Version.props)"
 
-    # The launcher is a static file pointing at a variable exe name and a
-    # variable payload directory. Nothing else would notice if the two drifted.
+    # The launcher is compiled, and its source pins the payload directory, the
+    # app exe name and the version. Nothing else would notice if any of those
+    # three drifted, so this check runs before a publish is even started.
     Write-Step "Checking launcher contract"
-    $launcherSource = Assert-LauncherContract -RepoRootPath $repoRoot
-    Write-Info ("{0} is ASCII and launches $($script:PayloadDir)\$(Get-MainExeName)" -f $script:LauncherName)
+    $launcher = Assert-LauncherContract -RepoRootPath $repoRoot
+    Write-Info ("{0} launches {1}\{2}, version {3}" -f `
+        $script:LauncherSourceRelativePath, $script:PayloadDir, (Get-MainExeName), $launcher.Version)
 
     # Only wipe the staging folder when this run actually publishes into it:
     # -SkipPublish means "reuse what is already there".
@@ -527,14 +531,33 @@ try {
     Write-Host ("    kept {0} file(s) ({1}); dropped {2} file(s) and {3} directory(ies)" -f `
         $result.Kept, (Format-Bytes $result.CopiedBytes), $result.Dropped, $result.DroppedDirs)
 
-    # Everything the allow-list accepted now goes into one subdirectory, and
-    # the launcher takes the root. This is what makes an unzipped package show
-    # two entries instead of the full payload listing.
-    Write-Step "Moving the payload into '$($script:PayloadDir)\' and installing the launcher"
-    $moved = Move-PayloadIntoSubdirectory -ReleaseDir $releaseDir -LauncherSourcePath $launcherSource
+    # Everything the allow-list accepted now goes into one subdirectory, which
+    # leaves the release root empty for the launcher to occupy.
+    Write-Step "Moving the payload into '$($script:PayloadDir)\'"
+    $moved = Move-PayloadIntoSubdirectory -ReleaseDir $releaseDir
     Write-Host ("    moved {0} file(s) and {1} directory(ies) into {2}" -f `
         $moved.MovedFiles, $moved.MovedDirs, $script:PayloadDir)
-    Write-Host ("    launcher: {0}" -f $moved.LauncherPath)
+
+    Write-Step "Building the launcher executable"
+    $launcherPath = Get-LauncherPath -ReleaseDir $releaseDir
+    $built = Build-Launcher -RepoRootPath $repoRoot -DestinationPath $launcherPath `
+                             -Version $launcher.Version
+    Write-Host ("    {0} ({1} bytes)" -f $built.Path, $built.Bytes)
+    Write-Host ("    compiler: {0}" -f $built.Compiler)
+
+    # The source being right does not mean the artifact is: csc can fail, the
+    # resource can fail to link, the subsystem can come out as console. This
+    # reads the shipped bytes back.
+    Write-Step "Verifying the built launcher"
+    $verified = Assert-CompiledLauncher -Path $launcherPath `
+        -ExpectedVersion $launcher.Version -ExpectResources $built.HasIcon
+    Write-Host ("    {0} / subsystem {1} / file version {2}" -f `
+        $verified.Machine, $verified.Subsystem, $verified.FileVersion)
+    if ($verified.HasIcon) {
+        Write-Host ("    icon embedded; product name '{0}'" -f $verified.ProductName)
+    } else {
+        Write-WarnLine "launcher ships without an icon (rc.exe unavailable on this machine)"
+    }
 
     Write-Step "Verifying release root layout"
     $rootEntries = Assert-ReleaseRootLayout -ReleaseDir $releaseDir

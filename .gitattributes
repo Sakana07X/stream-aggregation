@@ -1,10 +1,11 @@
 # Line endings are pinned only where they affect a shipped artifact.
-
-# build\launcher.bat ships inside the release archive. Without a rule here, git
-# rewrites its line endings on checkout according to the per-machine
-# core.autocrlf, so two clones of the same commit could pack different bytes
-# into the ZIP. CRLF is also what cmd.exe expects from a .bat.
 #
-# Scoped to *.bat on purpose: nothing else in this repository lands inside an
-# artifact, and pinning .ps1 would force a repo-wide reformat for no gain.
-*.bat text eol=crlf
+# There used to be one such rule here: *.bat text eol=crlf, for
+# build\launcher.bat. The launcher is now a compiled exe produced by
+# build\publish.ps1 from build\launcher\Launcher.cs, so nothing in this
+# repository lands inside a release archive as a working-tree file any more,
+# and pinning .ps1 would only force a repo-wide reformat for no gain.
+#
+# Note for anyone adding a rule back: git applies attributes on checkout
+# according to the per-machine core.autocrlf, so anything that ends up inside
+# an artifact is safer built than copied.

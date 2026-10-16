@@ -1,0 +1,63 @@
+// ---------------------------------------------------------------------------
+// Launcher.rc -- Win32 resources for the release launcher.
+//
+// Compiled by build/publish.ps1 with rc.exe into a .res, which is then passed
+// to csc.exe as /resource:. Two things end up in the shipped exe:
+//
+//   IDI_APPICON      the product icon, so the launcher looks like the app in
+//                    Explorer, the taskbar and the Alt+Tab list instead of
+//                    showing a generic application glyph.
+//   VS_VERSION_INFO  File Description / Product Name / version numbers, so
+//                    Explorer's details pane and Task Manager's process list
+//                    name the product rather than the file.
+//
+// Everything here is ASCII. The product name is injected at build time: this
+// file is read by rc.exe, which does not read UTF-8 reliably, and the name is
+// CJK. publish.ps1 substitutes the at-sign delimited placeholders below with
+// the same code points Common.ps1 uses, then compiles the result.
+// Assert-LauncherContract fails the build if one is left behind.
+//
+// The ico is resolved through rc.exe /i, which publish.ps1 points at
+// src/StreamingAggregation.App/Assets -- the single copy of the icon, the same
+// one that ships inside the payload.
+// ---------------------------------------------------------------------------
+
+#include <windows.h>
+
+IDI_APPICON ICON "@ICON@"
+
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION    @FILEVER@
+    PRODUCTVERSION @PRODVER@
+    FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+    FILEFLAGS      VS_FF_DEBUG
+#else
+    FILEFLAGS      0x0L
+#endif
+    FILEOS         VOS_NT_WINDOWS32
+    FILETYPE       VFT_APP
+    FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0409 = en-US, 04B0 = Unicode. The LCID does not have to match the
+        // user's UI language; it selects which table the following block is.
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "@COMPANY@"
+            VALUE "FileDescription",  "@FILEDESC@"
+            VALUE "FileVersion",      "@FILEVER@"
+            VALUE "InternalName",     "launcher"
+            VALUE "LegalCopyright",   ""
+            VALUE "OriginalFilename", "@LAUNCHERNAME@"
+            VALUE "ProductName",      "@PRODUCTNAME@"
+            VALUE "ProductVersion",   "@PRODVER@"
+            VALUE "Comments",         ""
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

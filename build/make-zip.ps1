@@ -2,7 +2,8 @@
 # Packs the whitelisted release directory into a ZIP and writes SHA-256 sums.
 #
 # ZIP layout rule from the handoff plan: the archive root holds the launcher
-# and the app\ payload directory, and nothing else. No wrapping folder.
+# executable and the app\ payload directory, and nothing else. No wrapping
+# folder.
 #
 # ASCII-only on purpose (PowerShell 5.1 reads BOM-less scripts as ANSI).
 #
@@ -266,7 +267,7 @@ try {
     $stats = Get-DirectoryStats -Path $ReleaseDir
     Write-Info ("packing {0} file(s), {1}" -f $stats.FileCount, (Format-Bytes $stats.Bytes))
 
-    Write-Step "Writing ZIP (root holds the launcher and the app\ payload)"
+    Write-Step "Writing ZIP (root holds the launcher exe and the app\ payload)"
     # -OutputRoot is honoured by the usage banner but was never created, so a
     # caller-supplied (or freshly cleaned) root made ZipFile.Open fail with
     # "part of the path could not be found" instead of producing the archive.

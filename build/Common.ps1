@@ -73,8 +73,8 @@ $script:SelfContainedRuntimeFiles = @(
 # The extracted package shows exactly two entries:
 #
 #   <release>/
-#     launcher.bat      <- the only file allowed at the root
-#     app/              <- the entire application payload
+#     <product name>.exe  <- the only file allowed at the root
+#     app/                <- the entire application payload
 #
 # The payload MUST live in one subdirectory, not be scattered across sibling
 # folders and not sit at the root. That is not a cosmetic choice; it is the
@@ -95,8 +95,21 @@ $script:SelfContainedRuntimeFiles = @(
 # Single subdirectory that holds the whole payload.
 $script:PayloadDir = 'app'
 
-# The one file allowed at the release root. Ships as build/launcher.bat.
-$script:LauncherName = 'launcher.bat'
+# The one file allowed at the release root. Built from build/launcher/, never
+# copied from the working tree: the bytes are a build product, so nothing
+# depends on core.autocrlf the way a checked-in .bat did.
+$script:LauncherName = (-join ($script:ProductNameCodePoints | ForEach-Object { [char]$_ })) + '.exe'
+
+# Launcher sources, relative to the repo root.
+#   Launcher.cs  the launcher itself; compiled to a .NET Framework 4.x winexe
+#   Launcher.rc  icon + VERSIONINFO, compiled by rc.exe and linked in as a
+#                .NET resource so the shipped exe carries both.
+$script:LauncherSourceRelativePath   = 'build\launcher\Launcher.cs'
+$script:LauncherResourceRelativePath = 'build\launcher\Launcher.rc'
+
+# The icon the launcher's .rc embeds. The single copy lives with the app; the
+# launcher references it by leaf name and gets the folder from rc.exe /i.
+$script:AppIconRelativePath = 'src\StreamingAggregation.App\Assets\AppIcon.ico'
 
 # Fixed location of the publishable project, relative to the repo root.
 $script:AppProjectRelativePath = 'src\StreamingAggregation.App\StreamingAggregation.App.csproj'
@@ -183,6 +196,18 @@ function Get-DeclaredAssemblyVersion {
     return $m.Groups[1].Value
 }
 
+# Three-part versions are legal for .NET; Win32 resources (VERSIONINFO, the
+# application manifest) only accept four. Pad rather than reject, so bumping
+# 0.2.0 -> 0.3.0 does not silently stop matching the resource.
+function ConvertTo-FourPartVersion {
+    param([string]$Version)
+    $parts = @($Version.Split('.'))
+    if ($parts.Count -gt 4) {
+        throw "Version '$Version' has more than four parts; Win32 version resources accept at most four."
+    }
+    return ($parts + @('0') * (4 - $parts.Count)) -join '.'
+}
+
 # =============================================================================
 # RELEASE LAYOUT HELPERS
 # Every path assertion in the pipeline is written against the payload
@@ -196,7 +221,7 @@ function Get-PayloadDirPath {
 }
 
 function Get-LauncherPath {
-    # <release>\launcher.bat
+    # <release>\<product name>.exe
     param([string]$ReleaseDir)
     return (Join-Path $ReleaseDir $script:LauncherName)
 }
@@ -274,92 +299,509 @@ function Assert-ReleaseRootLayout {
     return $entries
 }
 
-function Install-Launcher {
-    # Copies build/launcher.bat into the release root with its line endings
-    # pinned to CRLF.
-    #
-    # Deliberately not a plain file copy. git rewrites line endings on checkout
-    # according to core.autocrlf, which is a per-machine setting; the launcher
-    # ships inside the archive, so whatever the working tree happens to hold
-    # leaks straight into the ZIP hash and two builds of one commit stop being
-    # byte-identical. Normalising here makes the BUILD own those bytes rather
-    # than git. CRLF is also what cmd.exe expects from a .bat.
-    #
-    # ASCIIEncoding throws on any non-ASCII character. Assert-LauncherContract
-    # has already rejected those, so this is a second, independent gate rather
-    # than a lossy conversion.
-    param([string]$SourcePath, [string]$DestinationPath)
+# =============================================================================
+# LAUNCHER BUILD
+#
+# The launcher is COMPILED, not copied. Three consequences the old .bat did
+# not have:
+#
+#   - The source names the payload directory and the app exe as C# string
+#     constants, so Assert-LauncherContract reads them back and fails the build
+#     when they drift from Common.ps1. A launcher pointing at the wrong file
+#     still compiles cleanly and still "passes" every other check in this
+#     folder, so this is the only place that can catch it.
+#   - The shipped bytes do not depend on the working tree at all, so the
+#     core.autocrlf trap that Install-Launcher existed to work around is gone
+#     rather than fixed.
+#   - Two external tools are needed (csc.exe for the code, rc.exe for the
+#     icon and version resource). rc.exe is optional: without it the launcher
+#     builds and runs, it just ships with no icon and no version info, which
+#     is a cosmetic regression rather than a broken package.
+# =============================================================================
 
-    $text = [System.IO.File]::ReadAllText($SourcePath)
-    # Normalise to bare LF first: a CRLF source must not become CR CR LF.
-    $text = $text -replace "`r`n", "`n"
-    $text = $text -replace "`r", "`n"
-
-    # Drop the trailing blank element. Splitting "a\nb\n" yields a final empty
-    # string, and appending CRLF to that writes a blank line every run -- which
-    # would make each build's launcher two bytes larger than the last and break
-    # byte reproducibility in a way that is very hard to see.
-    $lineList = New-Object System.Collections.Generic.List[string]
-    foreach ($line in ($text -split "`n")) { $lineList.Add($line) }
-    while ($lineList.Count -gt 0 -and $lineList[$lineList.Count - 1] -eq '') {
-        $lineList.RemoveAt($lineList.Count - 1)
+function Find-CscPath {
+    # Highest-versioned .NET Framework compiler under %WINDIR%. Every Windows
+    # since 7 ships one; the v4.0.30319 folder is the in-place upgrade target
+    # and is the only one on a modern machine.
+    if ([string]::IsNullOrWhiteSpace($env:WINDIR)) {
+        throw 'WINDIR is not set; cannot locate csc.exe.'
     }
-
-    $builder = New-Object System.Text.StringBuilder
-    foreach ($line in $lineList) {
-        [void]$builder.Append($line)
-        [void]$builder.Append("`r`n")
+    $root = Join-Path (Join-Path $env:WINDIR 'Microsoft.NET') 'Framework64'
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        throw "No .NET Framework compiler directory: $root"
     }
-    [System.IO.File]::WriteAllText($DestinationPath, $builder.ToString(),
-                                   (New-Object System.Text.ASCIIEncoding))
-
-    # Carry the source timestamp across, for the same reason Copy-ReleaseWhitelist
-    # does: make-zip stores each entry's mtime, so a launcher stamped with the
-    # build clock makes every archive unique.
-    [System.IO.File]::SetLastWriteTimeUtc($DestinationPath,
-                                          [System.IO.File]::GetLastWriteTimeUtc($SourcePath))
+    $best = $null
+    $bestVersion = $null
+    foreach ($dir in (Get-ChildItem -LiteralPath $root -Directory)) {
+        $candidate = Join-Path $dir.FullName 'csc.exe'
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        # The folder is named 'v4.0.30319', which [version]::TryParse rejects
+        # because of the leading 'v'. Without the trim the loop below would
+        # silently find nothing and report the compiler as missing on a machine
+        # that has had it since Windows 7.
+        $version = $null
+        if (-not [version]::TryParse($dir.Name.TrimStart('v', 'V'), [ref]$version)) { continue }
+        if ($null -eq $bestVersion -or $version -gt $bestVersion) {
+            $best = $candidate
+            $bestVersion = $version
+        }
+    }
+    if ($null -eq $best) {
+        throw "No csc.exe found under $root. The launcher needs the .NET Framework compiler; install the .NET Framework 4 developer pack."
+    }
+    return $best
 }
 
-# Fail-closed check that build/launcher.bat still launches the pinned exe out
-# of the pinned subdirectory.
+function Find-RcToolchain {
+    # Returns the newest Windows SDK's rc.exe plus the two include folders it
+    # needs for <windows.h>, or $null when no SDK is installed.
+    #
+    # The SDK is a separate download from the .NET Framework, so this genuinely
+    # may be absent; callers must treat that as a downgrade, not a failure.
+    $kitRoot = $null
+    # ProgramFiles(x86) is absent on 32-bit Windows and ProgramFiles is absent
+    # on a few stripped images, so both are probed and neither may be joined
+    # blindly: Join-Path throws on a null path, which would turn "no SDK here"
+    # into a hard build failure instead of the documented downgrade.
+    foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles)) {
+        if ([string]::IsNullOrWhiteSpace($base)) { continue }
+        $candidate = Join-Path $base 'Windows Kits\10'
+        if (Test-Path -LiteralPath $candidate -PathType Container) { $kitRoot = $candidate }
+    }
+    if ([string]::IsNullOrWhiteSpace($kitRoot)) { return $null }
+
+    $best = $null
+    $bestVersion = $null
+    $binRoot = Join-Path $kitRoot 'bin'
+    if (-not (Test-Path -LiteralPath $binRoot -PathType Container)) { return $null }
+    foreach ($dir in (Get-ChildItem -LiteralPath $binRoot -Directory)) {
+        $candidate = Join-Path (Join-Path $dir.FullName 'x64') 'rc.exe'
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        $version = $null
+        if (-not [version]::TryParse($dir.Name, [ref]$version)) { continue }
+        if ($null -eq $bestVersion -or $version -gt $bestVersion) {
+            $best = $candidate
+            $bestVersion = $version
+        }
+    }
+    if ($null -eq $best) { return $null }
+
+    $includeRoot = Join-Path (Join-Path $kitRoot 'Include') $bestVersion.ToString()
+    $um = Join-Path $includeRoot 'um'
+    $shared = Join-Path $includeRoot 'shared'
+    if (-not (Test-Path -LiteralPath (Join-Path $um 'windows.h') -PathType Leaf)) { return $null }
+    if (-not (Test-Path -LiteralPath (Join-Path $shared 'sdkddkver.h') -PathType Leaf)) { return $null }
+
+    return [pscustomobject]@{
+        RcExe    = $best
+        IncludeU = $um
+        IncludeShared = $shared
+        Version  = $bestVersion.ToString()
+    }
+}
+
+function New-LauncherResourceFile {
+    # Renders build/launcher/Launcher.rc with its placeholders substituted and
+    # writes it as UTF-16LE with a BOM.
+    #
+    # The encoding is the whole reason this function exists. rc.exe reads a .rc
+    # in the ANSI code page, which is 936 on this machine and something else on
+    # the next one, and the product name it has to carry is CJK -- so the
+    # bytes written here would come out as mojibake on any machine whose ACP
+    # is not a superset of the source encoding. rc.exe does honour a UTF-16
+    # BOM, and that path is locale independent, so the generated file is
+    # UTF-16LE. The .rc on disk stays plain ASCII with placeholders.
+    #
+    # A second reason for the same encoding choice: rc.exe truncates its own
+    # error messages at the first non-ASCII character, and every path in this
+    # repository contains CJK. Build-Launcher runs it with the staging folder
+    # as the working directory and ASCII relative names so a real error is
+    # actually readable.
+    param(
+        [string]$TemplatePath,
+        [string]$OutputPath,
+        [string]$Version
+    )
+
+    $template = [System.IO.File]::ReadAllText($TemplatePath)
+    $productName = Get-ProductName
+    $fourPart = ConvertTo-FourPartVersion -Version $Version
+    $commaForm = ($fourPart -split '\.') -join ','
+
+    $substitutions = [ordered]@{
+        '@ICON@'          = [System.IO.Path]::GetFileName($script:AppIconRelativePath)
+        '@FILEVER@'       = $commaForm
+        '@PRODVER@'       = $commaForm
+        '@COMPANY@'       = ''
+        '@FILEDESC@'      = $productName
+        '@PRODUCTNAME@'   = $productName
+        '@LAUNCHERNAME@'  = $script:LauncherName
+    }
+    foreach ($key in $substitutions.Keys) {
+        $template = $template.Replace($key, $substitutions[$key])
+    }
+
+    # A leftover placeholder would reach rc.exe as a literal string and land in
+    # Explorer's property sheet. Cheap to catch, invisible until someone looks.
+    $leftover = [regex]::Match($template, '@[A-Z0-9_]+@')
+    if ($leftover.Success) {
+        throw ("Launcher.rc still contains the placeholder '{0}' after substitution. Known placeholders: {1}." -f `
+                $leftover.Value, (($substitutions.Keys) -join ', '))
+    }
+
+    [System.IO.File]::WriteAllText($OutputPath, $template, [System.Text.Encoding]::Unicode)
+    return $OutputPath
+}
+
+function Build-Launcher {
+    # Compiles the launcher into $DestinationPath.
+    #
+    # Returns a result object describing what was produced and, when rc.exe
+    # was unavailable, which parts are missing. Never throws for a missing
+    # resource toolchain -- that is a downgrade the caller reports, not a
+    # broken build.
+    param(
+        [string]$RepoRootPath,
+        [string]$DestinationPath,
+        [string]$Version
+    )
+
+    $sourcePath = Join-Path $RepoRootPath $script:LauncherSourceRelativePath
+    $resourceTemplate = Join-Path $RepoRootPath $script:LauncherResourceRelativePath
+    $iconDir = Join-Path $RepoRootPath ([System.IO.Path]::GetDirectoryName($script:AppIconRelativePath))
+    $iconPath = Join-Path $RepoRootPath $script:AppIconRelativePath
+    if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+        throw "Application icon not found: $iconPath"
+    }
+
+    $csc = Find-CscPath
+    $toolchain = Find-RcToolchain
+
+    # Scratch directory. Inside the repo, next to the other build logs, so a
+    # failed launcher build leaves its inputs and diagnostics where the rest of
+    # the pipeline's debugging artefacts already live.
+    $workDir = Join-Path (Join-Path $RepoRootPath '.tmp') 'launcher-build'
+    if (-not (Test-Path -LiteralPath $workDir -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $workDir -Force)
+    }
+    $workDir = (Resolve-Path -LiteralPath $workDir).Path
+
+    $resPath = Join-Path $workDir 'Launcher.res'
+    $haveResources = $false
+    if ($null -eq $toolchain) {
+        Write-WarnLine 'rc.exe (Windows SDK) not found; the launcher will ship without an icon or version resource.'
+    } else {
+        [void](New-LauncherResourceFile -TemplatePath $resourceTemplate `
+                                        -OutputPath (Join-Path $workDir 'Launcher.rc') `
+                                        -Version $Version)
+        $incArgs = ('/i "{0}" /i "{1}" /i "{2}"' -f $toolchain.IncludeU, $toolchain.IncludeShared, $iconDir)
+        $rcCommand = '"{0}" /nologo /fo "Launcher.res" {1} "Launcher.rc" 2>&1' -f $toolchain.RcExe, $incArgs
+        # Relative names + the staging folder as the working directory: rc.exe
+        # truncates its diagnostics at the first non-ASCII character and every
+        # path in this repo is CJK.
+        Push-Location $workDir
+        try {
+            $rcOutput = & cmd /c $rcCommand
+            $rcExit = $LASTEXITCODE
+        } finally {
+            Pop-Location
+        }
+        if ($rcExit -ne 0) {
+            $decoded = @($rcOutput) -join ' | '
+            throw ("rc.exe failed with exit code {0}: {1}`n    command: {2}" -f $rcExit, $decoded, $rcCommand)
+        }
+        $haveResources = Test-Path -LiteralPath $resPath -PathType Leaf
+        if (-not $haveResources) {
+            throw "rc.exe reported success but produced no $resPath"
+        }
+        Write-Info ("resources: rc.exe {0} -> {1} bytes" -f $toolchain.Version, (Get-Item -LiteralPath $resPath).Length)
+    }
+
+    $cscArgs = @(
+        '/nologo',
+        # The launcher source carries CJK literals for its error dialogs.
+        # Without /codepage:65001 csc.exe decodes the file in the machine's
+        # ANSI code page and every one of them becomes mojibake in the shipped
+        # binary -- on any machine whose ACP is not UTF-8.
+        '/codepage:65001',
+        '/target:winexe',
+        '/platform:x64',
+        '/optimize+',
+        '/debug-',
+        ('/out:' + $DestinationPath)
+    )
+    if ($haveResources) {
+        $cscArgs += ('/resource:' + $resPath)
+    }
+    $cscArgs += $sourcePath
+
+    $cscOutput = & $csc @cscArgs 2>&1
+    $cscExit = $LASTEXITCODE
+    if ($cscExit -ne 0) {
+        throw ("csc.exe failed with exit code {0}: {1}`n    command: {2} {3}" -f `
+            $cscExit, (@($cscOutput) -join ' | '), $csc, ($cscArgs -join ' '))
+    }
+    if (-not (Test-Path -LiteralPath $DestinationPath -PathType Leaf)) {
+        throw "csc.exe reported success but produced no $DestinationPath"
+    }
+
+    # Stamp the output with the newest input timestamp instead of the build
+    # clock. make-zip stores each entry's mtime, so leaving the clock in place
+    # would make every archive of an unchanged tree unique for no reason.
+    # (The launcher's bytes still differ between builds -- csc stamps a PE
+    # timestamp and emits a fresh assembly MVID -- so the ZIP hash is not
+    # byte-reproducible. The mtime at least stops being a moving target.)
+    $inputs = @($sourcePath, $resourceTemplate, $iconPath) | Where-Object { Test-Path -LiteralPath $_ }
+    $stamp = ($inputs | ForEach-Object { [System.IO.File]::GetLastWriteTimeUtc($_) } |
+              Measure-Object -Maximum).Maximum
+    if ($stamp) {
+        [System.IO.File]::SetLastWriteTimeUtc($DestinationPath, $stamp)
+    }
+
+    $info = Get-Item -LiteralPath $DestinationPath
+    return [pscustomobject]@{
+        Path          = $info.FullName
+        Bytes         = $info.Length
+        Compiler      = $csc
+        ResourceTool  = $(if ($toolchain) { $toolchain.RcExe } else { '' })
+        HasIcon       = $haveResources
+        HasVersion    = $haveResources
+    }
+}
+
+# Fail-closed check that build/launcher/Launcher.cs still launches the pinned
+# exe out of the pinned subdirectory, and carries the pinned version.
 #
-# launcher.bat is a static file while $script:MainAssemblyName and
-# $script:PayloadDir are variables, so renaming the assembly or the payload
-# directory would silently leave a launcher that starts nothing. Nothing else
-# in the build would notice: the payload is present, the allow-list is
-# satisfied, the archive is clean. This is the only place that knows the
-# launcher is a link and not just another file.
+# The launcher is a compiled artifact whose inputs are static files while
+# $script:MainAssemblyName, $script:PayloadDir and Version.props are variables,
+# so renaming any of those three would produce a launcher that starts nothing
+# and compiles without a warning. Nothing else in the build would notice: the
+# payload is present, the allow-list is satisfied, the archive is clean, and
+# the exe at the root is a perfectly valid PE file. This is the only place
+# that knows the launcher is a link and not just another file.
 function Assert-LauncherContract {
     param([string]$RepoRootPath = (Get-RepoRoot))
 
-    $launcherSource = Join-Path (Join-Path $RepoRootPath 'build') $script:LauncherName
-    if (-not (Test-Path -LiteralPath $launcherSource -PathType Leaf)) {
-        throw "Launcher source not found: $launcherSource"
+    $sourcePath = Join-Path $RepoRootPath $script:LauncherSourceRelativePath
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        throw "Launcher source not found: $sourcePath"
+    }
+    $resourceTemplate = Join-Path $RepoRootPath $script:LauncherResourceRelativePath
+    if (-not (Test-Path -LiteralPath $resourceTemplate -PathType Leaf)) {
+        throw "Launcher resource script not found: $resourceTemplate"
     }
 
-    # Read as bytes and fail on a BOM or any non-ASCII byte: cmd.exe decodes a
-    # .bat in the console code page, so either would corrupt it on a machine
-    # whose code page differs from the author's.
-    $bytes = [System.IO.File]::ReadAllBytes($launcherSource)
-    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-        throw "$($script:LauncherName) starts with a UTF-8 BOM; cmd.exe will try to execute it."
+    # Decoded strictly: throwOnInvalidBytes, so a file that was actually saved
+    # in the machine's ANSI code page fails here instead of turning every
+    # Chinese string literal into mojibake inside the shipped exe.
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    try {
+        $text = $strictUtf8.GetString([System.IO.File]::ReadAllBytes($sourcePath))
+    } catch {
+        throw ("{0} is not valid UTF-8. It is compiled with /codepage:65001, so anything else turns its string literals into mojibake. {1}" -f `
+                $script:LauncherSourceRelativePath, $_.Exception.Message)
     }
-    foreach ($b in $bytes) {
-        if ($b -gt 127) {
-            throw ("{0} contains a non-ASCII byte (0x{1:X2}); cmd.exe reads .bat files in the console code page. Keep it ASCII." -f $script:LauncherName, $b)
+
+    $expectedExeName = Get-MainExeName
+    $fourPart = ConvertTo-FourPartVersion -Version (Get-DeclaredAssemblyVersion -RepoRootPath $RepoRootPath)
+
+    $required = [ordered]@{
+        'PayloadDirectoryName' = $script:PayloadDir
+        'PayloadExeName'       = $expectedExeName
+    }
+    foreach ($entry in $required.GetEnumerator()) {
+        $pattern = [regex]::Escape($entry.Key) + '\s*=\s*"' + [regex]::Escape($entry.Value) + '"'
+        if ($text -notmatch $pattern) {
+            throw ("{0} does not pin {1} to '{2}'. The release layout is pinned to <root>/{3}/<payload>; update the launcher's constants when either changes." -f `
+                    $script:LauncherSourceRelativePath, $entry.Key, $entry.Value, $script:PayloadDir)
         }
     }
 
-    $text = [System.IO.File]::ReadAllText($launcherSource)
-    $expectedDirRef = "$($script:PayloadDir)\"
-    if ($text -notmatch [regex]::Escape($expectedDirRef)) {
-        throw ("{0} does not reference the payload directory '{1}'. The release layout is pinned to <root>/{1}/<payload>." -f $script:LauncherName, $expectedDirRef)
+    foreach ($attribute in @('AssemblyVersion', 'AssemblyFileVersion')) {
+        $pattern = '\[assembly:\s*' + $attribute + '\(\s*"' + [regex]::Escape($fourPart) + '"\s*\)\]'
+        if ($text -notmatch $pattern) {
+            throw ("{0} does not pin [assembly: {1}('{2}')] to the version in build/Version.props ({3})." -f `
+                    $script:LauncherSourceRelativePath, $attribute, $fourPart, (Get-DeclaredAssemblyVersion -RepoRootPath $RepoRootPath))
+        }
     }
-    $exeName = Get-MainExeName
-    if ($text -notmatch [regex]::Escape($exeName)) {
-        throw ("{0} does not reference '$exeName'. Regenerate it if $script:MainAssemblyName changed." -f $script:LauncherName)
+
+    # The version the .rc will be rendered with must come from the same place,
+    # and the .rc must not carry a hand-written version that can drift.
+    $rcText = [System.IO.File]::ReadAllText($resourceTemplate)
+    foreach ($byte in [System.Text.Encoding]::ASCII.GetBytes($rcText)) {
+        if ($byte -gt 127) {
+            throw ("{0} contains a non-ASCII byte (0x{1:X2}). It is a template read by rc.exe, which decodes .rc files in the ANSI code page; keep it ASCII with placeholders." -f `
+                    $script:LauncherResourceRelativePath, $byte)
+        }
     }
-    return $launcherSource
+    foreach ($placeholder in @('@ICON@', '@FILEVER@', '@PRODVER@', '@PRODUCTNAME@', '@FILEDESC@', '@LAUNCHERNAME@')) {
+        if ($rcText -notmatch [regex]::Escape($placeholder)) {
+            throw ("{0} has no '{1}' placeholder. It is rendered by New-LauncherResourceFile, so every value that must not be hard-coded needs one." -f `
+                    $script:LauncherResourceRelativePath, $placeholder)
+        }
+    }
+    # Whitespace-normalised so this does not depend on how the columns line up
+    # in the template. Checks the VALUE is a placeholder rather than a literal
+    # number, which is what would silently fork the version away from
+    # Version.props the next time somebody bumps it.
+    $normalized = ($rcText -replace '\s+', ' ')
+    foreach ($keyword in @('FILEVERSION', 'PRODUCTVERSION')) {
+        if ($normalized -match ('(?i)\b' + $keyword + '\s+\d')) {
+            $expected = $(if ($keyword -eq 'FILEVERSION') { '@FILEVER@' } else { '@PRODVER@' })
+            throw ("{0} sets {1} to a literal number. It must be {2}, rendered from build/Version.props, so that file stays the only place the version is written." -f `
+                    $script:LauncherResourceRelativePath, $keyword, $expected)
+        }
+    }
+
+    return [pscustomobject]@{
+        SourcePath       = $sourcePath
+        ResourceTemplate = $resourceTemplate
+        Version          = $fourPart
+    }
+}
+
+# Fail-closed check of the launcher that actually shipped.
+#
+# Assert-LauncherContract proves the SOURCE is right; this proves the ARTIFACT
+# is. The gap between them is not hypothetical: csc can fail, rc.exe can be
+# absent, a resource can silently fail to link, and in every one of those cases
+# the release directory still ends up holding a well-formed file at the root
+# that starts nothing -- or starts something with a generic icon and the wrong
+# version in Explorer's property sheet.
+#
+# Checked here rather than by the smoke test because the smoke test can only
+# observe a launch, and a launcher with no icon launches perfectly well.
+function Assert-CompiledLauncher {
+    param(
+        [string]$Path,
+        [string]$ExpectedVersion,
+        [bool]$ExpectResources = $true
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Launcher executable not found: $Path"
+    }
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $length = $bytes.Length
+
+    # A plausible size is a cheap first gate: an empty or truncated file is the
+    # most common way a botched resource link shows up, and every later check
+    # below reads at a fixed offset.
+    if ($length -lt 4KB -or $length -gt 1MB) {
+        throw ("{0} is {1} bytes, which is not a launcher. Expected a .NET Framework winexe between 4 KB and 1 MB." -f `
+                $script:LauncherName, $length)
+    }
+    if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+        throw ("{0} does not start with 'MZ'; it is not a PE executable." -f $script:LauncherName)
+    }
+
+    $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3C)
+    if ($peOffset -lt 0 -or $peOffset + 24 -gt $length) {
+        throw ("{0} has an out-of-range PE header offset (0x{1:X})." -f $script:LauncherName, $peOffset)
+    }
+    if ($bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset + 1] -ne 0x45 -or
+        $bytes[$peOffset + 2] -ne 0x00 -or $bytes[$peOffset + 3] -ne 0x00) {
+        throw ("{0} has no 'PE\0\0' signature at the PE header offset." -f $script:LauncherName)
+    }
+
+    $coff = $peOffset + 4
+    $machine = [System.BitConverter]::ToUInt16($bytes, $coff)
+    if ($machine -ne 0x014C -and $machine -ne 0x8664) {
+        throw ("{0} targets machine 0x{1:X4}; only x86 (0x014C) and x64 (0x8664) are supported." -f `
+                $script:LauncherName, $machine)
+    }
+    $optionalSize = [System.BitConverter]::ToUInt16($bytes, $coff + 16)
+    $optional = $coff + 20
+    if ($optional + $optionalSize -gt $length) {
+        throw ("{0} has a truncated optional header." -f $script:LauncherName)
+    }
+
+    $magic = [System.BitConverter]::ToUInt16($bytes, $optional)
+    $isPe32Plus = ($magic -eq 0x020B)
+    if ($magic -ne 0x010B -and -not $isPe32Plus) {
+        throw ("{0} has an unknown optional header magic 0x{1:X4}." -f $script:LauncherName, $magic)
+    }
+
+    # Subsystem 2 is IMAGE_SUBSYSTEM_WINDOWS_GUI. This is the one PE field
+    # that directly encodes the user-visible requirement: a console subsystem
+    # flashes a black window on every double-click, which is exactly what the
+    # .bat it replaced was chosen to avoid.
+    $subsystem = [System.BitConverter]::ToUInt16($bytes, $optional + 68)
+    if ($subsystem -ne 2) {
+        $what = $(if ($subsystem -eq 3) { 'IMAGE_SUBSYSTEM_WINDOWS_CUI (a black console window on every double-click)' }
+                 else { "subsystem $subsystem" })
+        throw ("{0} is built as {1}. It must be /target:winexe (IMAGE_SUBSYSTEM_WINDOWS_GUI)." -f $script:LauncherName, $what)
+    }
+
+    # Data directory entry 2 is the resource table. Non-zero means rc.exe's
+    # output was linked in rather than silently dropped.
+    #
+    # Offsets into the optional header differ between PE32 and PE32+ because
+    # PE32+ widens ImageBase and the four stack/heap sizes from 4 to 8 bytes:
+    #   standard fields  28 bytes (PE32) / 24 bytes (PE32+)
+    #   windows fields   68 bytes (PE32) / 84 bytes (PE32+)
+    # Subsystem sits at +68 either way -- the extra bytes all sit before it in
+    # PE32+ and after it as well, which cancels out.
+    $dataDirectory = if ($isPe32Plus) { 112 } else { 96 }
+    $resourceEntry = $optional + $dataDirectory + (2 * 8)
+    if ($resourceEntry + 8 -gt $length) {
+        throw ("{0} has no data directory entry for the resource table." -f $script:LauncherName)
+    }
+    $resourceSize = [System.BitConverter]::ToUInt32($bytes, $resourceEntry + 4)
+    if ($ExpectResources -and $resourceSize -eq 0) {
+        throw ("{0} carries no resource directory: the icon and version information were not linked in." -f $script:LauncherName)
+    }
+
+    $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
+    $productName = Get-ProductName
+    $expectedFileVersion = ConvertTo-FourPartVersion -Version $ExpectedVersion
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    if ($version.FileVersion -cne $expectedFileVersion) {
+        $problems.Add("file version is '$($version.FileVersion)', expected '$expectedFileVersion'")
+    }
+    if ($version.ProductName -cne $productName) {
+        $problems.Add("product name is '$($version.ProductName)', expected the product name")
+    }
+    if ($version.FileDescription -cne $productName) {
+        $problems.Add("file description is '$($version.FileDescription)', expected the product name")
+    }
+    if ($version.OriginalFilename -cne $script:LauncherName) {
+        $problems.Add("original filename is '$($version.OriginalFilename)', expected '$($script:LauncherName)'")
+    }
+    if ($problems.Count -gt 0) {
+        throw ("{0} carries the wrong version information, {1} problem(s):`n    {2}" -f `
+                $script:LauncherName, $problems.Count, ($problems -join "`n    "))
+    }
+
+    $hasIcon = $false
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($Path)
+        if ($null -ne $icon) {
+            $hasIcon = ($icon.Width -gt 0)
+            $icon.Dispose()
+        }
+    } catch {
+        # System.Drawing is not present everywhere (Server Core, some locked
+        # down images). Missing verification is not a broken launcher.
+        Write-WarnLine ("Could not verify the launcher icon: {0}" -f $_.Exception.Message)
+    }
+
+    if ($ExpectResources -and -not $hasIcon) {
+        throw ("{0} has a version resource but no icon. rc.exe reported success, so the .rc's ICON line did not match anything." -f $script:LauncherName)
+    }
+
+    return [pscustomobject]@{
+        Path        = $Path
+        Bytes       = $length
+        Machine     = $(if ($machine -eq 0x8664) { 'x64' } else { 'x86' })
+        Subsystem   = 'WINDOWS_GUI'
+        FileVersion = $version.FileVersion
+        ProductName = $version.ProductName
+        HasIcon     = $hasIcon
+    }
 }
 
 # Fail-closed check that the release will actually start.
@@ -388,12 +830,7 @@ function Assert-ManifestIdentity {
     }
 
     $declared = Get-DeclaredAssemblyVersion -RepoRootPath $RepoRootPath
-    $expected = $declared
-    if ($expected -notmatch '^\d+\.\d+\.\d+\.\d+$') {
-        # Three-part assembly versions are legal for .NET; pad them for SxS.
-        $parts = $expected.Split('.')
-        $expected = ($parts + @('0') * (4 - $parts.Count)) -join '.'
-    }
+    $expected = ConvertTo-FourPartVersion -Version $declared
     if ($manifestVersion -ne $expected) {
         throw ("Application manifest assemblyIdentity '$manifestVersion' does not match build/Version.props AssemblyVersion '$declared' (expected '$expected').")
     }
