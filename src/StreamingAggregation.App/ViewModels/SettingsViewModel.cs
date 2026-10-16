@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using StreamingAggregation.Core.Abstractions;
 using StreamingAggregation.Core.Configuration;
+using StreamingAggregation.Infrastructure.ViewModels;
 
 namespace StreamingAggregation.App.ViewModels;
 

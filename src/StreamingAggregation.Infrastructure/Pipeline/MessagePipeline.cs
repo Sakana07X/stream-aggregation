@@ -6,11 +6,10 @@ using StreamingAggregation.Core.Abstractions;
 using StreamingAggregation.Core.Aggregation;
 using StreamingAggregation.Core.Filtering;
 using StreamingAggregation.Core.Models;
-using StreamingAggregation.Infrastructure;
 using StreamingAggregation.Infrastructure.Aggregation;
 using StreamingAggregation.Infrastructure.OneBot;
 
-namespace StreamingAggregation.App.Composition;
+namespace StreamingAggregation.Infrastructure.Pipeline;
 
 /// <summary>
 /// 消息管线：把 OneBot 事件流转成"消息落库 → 进聚合窗口 → 到点摘要 → 待办入库 → 紧急通知"。
@@ -31,11 +30,17 @@ namespace StreamingAggregation.App.Composition;
 /// 本类只负责"什么时候该处理哪个批次"，不重复实现编排。
 /// </para>
 /// <para>
+/// <b>为什么放在 Infrastructure 而不是留在 WinUI 侧</b>：本类只依赖 Core 抽象与 Infrastructure 的
+/// <see cref="BatchProcessor"/>、<see cref="GroupWhitelistMatcher"/> 等类型，不碰任何 UI 类型。
+/// 原先它写在 App 程序集里，而测试宿主加载不了 WinUI 程序集，于是"暂停时消息会不会落库"
+/// "催熟间隔怎么算"这类纯逻辑只能靠手点验证。下沉之后测试项目可以直接构造并断言。
+/// </para>
+/// <para>
 /// 管线自身不创建 <see cref="IDisposable"/> 资源（连接、<see cref="IDisposable"/> 服务都由
 /// 组合根持有与释放），因此没有 <c>Dispose</c>；停止靠取消 <see cref="CancellationToken"/>。
 /// </para>
 /// </remarks>
-internal sealed class MessagePipeline
+public sealed class MessagePipeline
 {
     /// <summary>催熟间隔的最小值：窗口再短也不必比这更频繁地扫。</summary>
     private static readonly TimeSpan MinimumFlushInterval = TimeSpan.FromSeconds(5);

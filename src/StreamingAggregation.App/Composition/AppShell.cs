@@ -1,6 +1,7 @@
 using System;
 using Microsoft.UI.Xaml.Controls;
 using StreamingAggregation.App.ViewModels;
+using StreamingAggregation.Infrastructure.ViewModels;
 
 namespace StreamingAggregation.App.Composition;
 

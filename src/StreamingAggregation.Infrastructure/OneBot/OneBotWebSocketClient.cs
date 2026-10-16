@@ -327,6 +327,8 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
         {
             while (!cancellationToken.IsCancellationRequested)
             {
+                // 这里的 reason 只回答「这一步为什么发生」，不是错误：组合根会另外把
+                // Tracker.LastError 带给界面，因此上一次的真实失败原因不会被这句覆盖。
                 _tracker.TryTransition(
                     ConnectionState.Connecting,
                     consecutiveFailures == 0 ? "首次连接。" : $"第 {consecutiveFailures + 1} 次连接尝试。");
@@ -357,11 +359,15 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
         {
             // 理论不可达；兜底捕获，保证通道一定被收尾、状态不会卡在中间态。
             fatal = ex;
-            Log(OneBotDiagnosticLevel.Error, $"事件循环异常终止：{Sanitize(ex.Message)}", ex);
+            var reason = $"事件循环异常终止：{Sanitize(ex.Message)}";
+            _tracker.RecordError(reason);
+            Log(OneBotDiagnosticLevel.Error, reason, ex);
         }
         finally
         {
-            _tracker.TryTransition(ConnectionState.Disconnected, "事件循环结束。");
+            // 「事件循环结束。」只在没有真实错误时使用：否则这句收尾文案会把真正的失败原因盖掉，
+            // 而此刻这恰恰是用户唯一能看到的东西。
+            _tracker.TryTransition(ConnectionState.Disconnected, _tracker.LastError ?? "事件循环结束。");
             writer.TryComplete(fatal);
         }
     }
@@ -408,8 +414,16 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
         }
         catch (Exception ex)
         {
-            _tracker.RecordError(Sanitize(ex.Message));
-            Log(OneBotDiagnosticLevel.Error, $"连接或接收失败：{Sanitize(ex.Message)}", ex);
+            var reason = Sanitize(ex.Message);
+            _tracker.RecordError(reason);
+
+            // 真实错误必须同时走状态事件，只 RecordError 是不够的：
+            // 组合根只订阅 StateChanged，错误只落在 tracker 里的话界面根本收不到，
+            // 用户看到的仍然是「等待退避后重连。」。
+            // 若此处已经是 Reconnecting，这次迁移会被 tracker 当作无操作丢弃；
+            // 但错误仍留在 Tracker.LastError 中，下一次迁移会由组合根带出去，因此不会丢。
+            _tracker.TryTransition(ConnectionState.Reconnecting, reason);
+            Log(OneBotDiagnosticLevel.Error, $"连接或接收失败：{reason}", ex);
             return new SessionResult(SessionOutcome.Completed, Connected: false);
         }
         finally
@@ -436,6 +450,9 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
             return false;
         }
 
+        // 同上：这是流程文案，不是错误原因。此刻 Tracker.LastError 里已经躺着真正的失败摘要，
+        // 组合根会把它一起推给界面。若这次迁移是空操作（已经是 Reconnecting），
+        // 真实错误已由本次会话内的迁移推过一次，不会因此丢失。
         _tracker.TryTransition(ConnectionState.Reconnecting, "等待退避后重连。");
 
         var delay = _reconnectPolicy.GetDelay(consecutiveFailures - 1);

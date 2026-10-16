@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 
-namespace StreamingAggregation.App.ViewModels;
+namespace StreamingAggregation.Infrastructure.ViewModels;
 
 /// <summary>
 /// 极简 MVVM 通知基类。
