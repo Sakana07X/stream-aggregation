@@ -1,0 +1,28 @@
+<!--
+  版本号单一事实源（Single Source of Truth）。
+
+  本文件是全解决方案唯一的版本定义处：
+    - Version            对外产品版本（SemVer 主版本号）
+    - AssemblyVersion    程序集版本（纯数字、三段式，不带预发布后缀）
+    - FileVersion        文件版本（纯数字、三段式，不带预发布后缀）
+    - InformationalVersion 完整版本串（如需预发布标签，写在这里）
+
+  根目录 Directory.Build.props 会自动 Import 本文件，
+  因此所有项目（App / Core / Infrastructure / Tests）自动继承，
+  不要在各自的 csproj 里重复定义这些属性。
+
+  规则：
+    - 递增时只改这里，文件名、manifest、csproj 都不再各自维护版本号。
+    - AssemblyVersion / FileVersion 必须是纯数字分段，禁止 -beta / +build 之类后缀；
+      预发布信息一律放进 InformationalVersion。
+-->
+<Project>
+
+  <PropertyGroup>
+    <Version>0.2.0</Version>
+    <AssemblyVersion>0.2.0</AssemblyVersion>
+    <FileVersion>0.2.0</FileVersion>
+    <InformationalVersion>$(Version)</InformationalVersion>
+  </PropertyGroup>
+
+</Project>

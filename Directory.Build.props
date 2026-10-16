@@ -1,0 +1,9 @@
+<!--
+  根目录 Directory.Build.props：MSBuild 会自动把它应用到其下所有项目。
+  这里只负责引入版本号单一事实源，不改动各项目既有配置。
+-->
+<Project>
+
+  <Import Project="$(MSBuildThisFileDirectory)build\Version.props" />
+
+</Project>
