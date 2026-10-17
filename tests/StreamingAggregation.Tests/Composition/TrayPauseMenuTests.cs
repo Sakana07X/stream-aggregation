@@ -10,12 +10,17 @@ namespace StreamingAggregation.Tests.Composition;
 /// <remarks>
 /// <para>
 /// <b>为什么不直接 new TrayIconService 测行为</b>：<c>StreamingAggregation.App</c> 是
-/// WinUI unpackaged 程序集，测试宿主加载它需要 XAML/WinRT 运行时（同
-/// <see cref="SettingsPageSecurityTests"/> 的说明），因此改为核对源码。
+/// WPF + net48 可执行程序集，测试宿主是一个控制台进程，加载它需要 STA 线程与 WPF
+/// 消息泵（同 <see cref="SettingsPageSecurityTests"/> 的说明），因此改为核对源码。
 /// </para>
 /// <para>
 /// 这条测试挡住的是两类回归：暂停项的 <c>Command</c> 被删掉（托盘菜单重新点了没反应），
 /// 以及菜单文案不再随状态更新（暂停后仍显示「暂停处理」）。
+/// </para>
+/// <para>
+/// <b>阶段 2 迁移</b>：WinUI 的 <c>MenuFlyout</c>/<c>MenuFlyoutItem</c> 换成 WPF 的
+/// <c>ContextMenu</c>/<c>MenuItem</c>，因此下面锚定的方法签名也跟着换；
+/// 「必须绑定 Command、必须保留 Tag」这两条断言的意图不变。
 /// </para>
 /// </remarks>
 public sealed class TrayPauseMenuTests
@@ -37,7 +42,7 @@ public sealed class TrayPauseMenuTests
     {
         var source = RepositorySourceFile.Read(TrayIconServiceRelativePath);
 
-        var buildMenuBody = RepositorySourceFile.ExtractMethodBody(source, "private MenuFlyout BuildContextMenu()");
+        var buildMenuBody = RepositorySourceFile.ExtractMethodBody(source, "private ContextMenu BuildContextMenu()");
         Assert.False(
             string.IsNullOrEmpty(buildMenuBody),
             "TrayIconService.cs 中找不到 BuildContextMenu() 方法体，无法核对暂停项绑定。");

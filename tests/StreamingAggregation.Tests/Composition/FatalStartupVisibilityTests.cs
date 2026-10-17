@@ -9,17 +9,28 @@ namespace StreamingAggregation.Tests.Composition;
 /// <remarks>
 /// <para>
 /// <b>要挡住的回归</b>：启动顺序是"迁移 → 读设置 → 探测通知 → 建连接 → 最后才开窗口"。
-/// 前面任何一步抛异常时，<c>MainWindowRoot</c> 还是 <see langword="null"/>，
-/// 挂不上 <c>ContentDialog</c>。而 <c>OnLaunched</c> 里的启动任务又是刻意不 await 的——
-/// 异常一旦被 <c>catch</c> 吞掉，WinUI 的消息泵照常运行，
+/// 前面任何一步抛异常时主窗口压根还不存在，而 <c>OnStartup</c> 里的启动任务又是刻意
+/// 不 await 的——异常一旦被 <c>catch</c> 吞掉，WPF 的消息泵照常运行，
 /// 用户看到的就是一个"进程在任务管理器里、但什么都没有"的幽灵应用。
 /// 所以这两件事必须同时成立：<b>有兜底对话框</b>，且<b>兜底之后显式退出</b>。
 /// </para>
 /// <para>
 /// <b>为什么用源码断言而不是跑行为</b>：同 <see cref="SettingsPageSecurityTests"/>——
-/// <c>StreamingAggregation.App</c> 是 WinUI unpackaged 程序集，测试宿主加载它需要
-/// XAML/WinRT 运行时，而"启动失败"这条路径本身要求"没有窗口"。
+/// <c>StreamingAggregation.App</c> 是 WPF 可执行程序集，测试宿主加载它需要 STA 线程与
+/// WPF 消息泵，而"启动失败"这条路径本身要求"没有窗口"。
 /// 真实行为只能在真机上手工验证（步骤见 PR 描述），这里退化成"源码里确实这么写"。
+/// </para>
+/// <para>
+/// <b>阶段 2 迁移（WinUI 3 → WPF/net48）</b>：三条锚点随实现一起改名，
+/// 断言的<b>意图</b>（失败必须可见 + 失败必须退出）一条没变：
+/// <list type="bullet">
+/// <item><description><c>OnLaunched</c> → <c>OnStartup</c>（WPF 的启动回调名）。</description></item>
+/// <item><description><c>MainWindowRoot</c>/<c>XamlRoot</c> 判空分支整体消失：
+/// WPF 的致命错误统一走 Win32 <c>MessageBox</c>，本来就不需要窗口。</description></item>
+/// <item><description><c>ReportFatalErrorAndExit</c> → <c>ShowFatalErrorAndShutdown</c>：
+/// 退出走 <c>Application.Shutdown(exitCode)</c>（能触发 <c>Exit</c> 事件让组合根收尾），
+/// <c>Environment.Exit</c> 只作为「连 <c>Application.Current</c> 都没有」的兜底。</description></item>
+/// </list>
 /// </para>
 /// </remarks>
 public sealed class FatalStartupVisibilityTests
@@ -35,42 +46,46 @@ public sealed class FatalStartupVisibilityTests
     private const string DialogTitle = "流式聚合启动失败";
 
     /// <summary>
-    /// <see cref="App"/> 判空分支的第一条语句必须是"上报并退出"。
+    /// 致命错误必须走一条<b>不依赖任何窗口</b>的路径，且这条路径没有"静默 return"。
     /// </summary>
     /// <remarks>
-    /// 这条断言直接锁死最初的缺陷形态：<c>if (root.MainWindowRoot is not { } xamlRoot) { return; }</c>。
-    /// 允许判空分支里先写一行 Trace，但绝不允许以 <c>return</c> 收尾而不上报。
+    /// WinUI 3 时代这里断言的是"判空 <c>MainWindowRoot</c> 后第一时间 <c>ReportFatalErrorAndExit</c>"，
+    /// 用来锁死 <c>if (root.MainWindowRoot is null) { return; }</c> 这种缺陷形态。
+    /// 迁到 WPF 后那条判空分支不再存在——Win32 <c>MessageBox</c> 不需要界面根，
+    /// 于是等价的不变量变成：<b>App.xaml.cs 里不存在 <c>ContentDialog</c>/<c>XamlRoot</c>，
+    /// 也不存在"只写 Trace 就 return"的裸逃逸</b>。
     /// </remarks>
     [Fact]
-    public void ReportFatalErrorAsyncReportsWhenNoWindowExists()
+    public void FatalErrorPathNeedsNoWindowAndNeverReturnsSilently()
     {
         var source = RepositorySourceFile.Read(AppRelativePath);
 
-        var body = RepositorySourceFile.ExtractMethodBody(
-            source,
-            "private static async Task ReportFatalErrorAsync(");
+        Assert.False(
+            Regex.IsMatch(source, @"\bContentDialog\b", RegexOptions.CultureInvariant),
+            "App.xaml.cs 仍在用 ContentDialog：它必须挂在某个 XamlRoot 上才能显示，" +
+            "而启动早期这条路径上窗口恰恰还不存在。");
 
         Assert.False(
-            string.IsNullOrEmpty(body),
-            "App.xaml.cs 中找不到 ReportFatalErrorAsync 方法体，无法核对启动失败的兜底路径。");
+            Regex.IsMatch(source, @"\bXamlRoot\b", RegexOptions.CultureInvariant),
+            "App.xaml.cs 仍引用 XamlRoot；WPF 版致命错误统一走 Win32 MessageBox，不需要界面根。");
 
-        // 判空分支的右花括号后必须紧跟兜底上报调用，中间不能插入别的东西。
+        // 兜底上报必须被显式 await / 触发：写成 `catch { Trace...; return; }` 就是静默失败。
+        Assert.False(
+            Regex.IsMatch(source, @"catch\s*\(\s*Exception\s+\w+\s*\)\s*\{\s*\}\s*", RegexOptions.CultureInvariant),
+            "App.xaml.cs 存在空的 catch：启动异常会被静默吞掉，消息泵照常运行，进程变成幽灵。");
+
         Assert.True(
-            Regex.IsMatch(
-                body!,
-                @"MainWindowRoot\s+is\s+not\s*\{[^{}]*\}\s*xamlRoot\s*\)\s*\{\s*ReportFatalErrorAndExit\s*\(",
-                RegexOptions.CultureInvariant),
-            "ReportFatalErrorAsync 在 MainWindowRoot 为 null 时没有第一时间走兜底上报，" +
-            "早期启动失败仍会静默 return，留下无界面进程。");
+            Regex.IsMatch(source, @"FatalErrorDialog\.Show\s*\(", RegexOptions.CultureInvariant),
+            "App.xaml.cs 没有调用 FatalErrorDialog.Show，致命错误对用户不可见。");
     }
 
     /// <summary>
     /// 兜底路径必须先弹 Win32 对话框，再退出进程；且退出码为 1。
     /// </summary>
     /// <remarks>
-    /// 顺序不能反：<c>Environment.Exit</c> 一旦执行，后面的语句全部不执行，
+    /// 顺序不能反：<c>Shutdown</c>/<c>Environment.Exit</c> 一旦执行，后面的语句全部不执行，
     /// 先退出就等于什么都没告诉用户。另外，<c>StartAsync</c> 是刻意不 await 的，
-    /// 不显式 <c>Environment.Exit</c> 就没有第二个能结束进程的机会。
+    /// 不显式退出就没有第二个能结束进程的机会。
     /// </remarks>
     [Fact]
     public void FatalFallbackShowsDialogBeforeExiting()
@@ -79,60 +94,83 @@ public sealed class FatalStartupVisibilityTests
 
         var body = RepositorySourceFile.ExtractMethodBody(
             source,
-            "private static void ReportFatalErrorAndExit(");
+            "private static void ShowFatalErrorAndShutdown(");
 
         Assert.False(
             string.IsNullOrEmpty(body),
-            "App.xaml.cs 中找不到 ReportFatalErrorAndExit 方法体，无法核对退出时机。");
+            "App.xaml.cs 中找不到 ShowFatalErrorAndShutdown 方法体，无法核对退出时机。");
 
         var showIndex = body!.IndexOf("FatalErrorDialog.Show(", StringComparison.Ordinal);
+        var shutdownIndex = body.IndexOf("Shutdown(", StringComparison.Ordinal);
         var exitIndex = body.IndexOf("Environment.Exit(", StringComparison.Ordinal);
 
         Assert.True(showIndex >= 0, "兜底路径没有调用 FatalErrorDialog.Show，用户看不到任何提示。");
-        Assert.True(exitIndex >= 0, "兜底路径没有调用 Environment.Exit，会留下无界面常驻进程。");
         Assert.True(
-            showIndex < exitIndex,
+            shutdownIndex >= 0 || exitIndex >= 0,
+            "兜底路径既没有 Application.Shutdown 也没有 Environment.Exit，会留下无界面常驻进程。");
+        Assert.True(
+            shutdownIndex < 0 || showIndex < shutdownIndex,
+            "Shutdown 出现在 FatalErrorDialog.Show 之前：进程先退出，提示将永远看不到。");
+        Assert.True(
+            exitIndex < 0 || showIndex < exitIndex,
             "Environment.Exit 出现在 FatalErrorDialog.Show 之前：进程先退出，提示将永远看不到。");
 
         // 退出码必须是 1，便于安装器/脚本把"启动失败"与"用户主动退出"区分开。
         Assert.True(
             Regex.IsMatch(source, @"FatalStartupExitCode\s*=\s*1\s*;", RegexOptions.CultureInvariant),
             "启动失败的退出码必须是 1。");
+
+        // 退出码必须真的传进 Shutdown，而不是 Shutdown() 之后靠 Environment.ExitCode 兜。
+        Assert.True(
+            Regex.IsMatch(source, @"Shutdown\s*\(\s*FatalStartupExitCode\s*\)", RegexOptions.CultureInvariant),
+            "Application.Shutdown 没有带上 FatalStartupExitCode，启动失败的退出码会退化成 0。");
     }
 
     /// <summary>
-    /// <c>OnLaunched</c> 里的组合根创建也必须被包住：调度器缺失与构造失败都发生在
-    /// <see cref="App.StartAsync"/> 之前，漏掉它们等于多留一个静默失败点。
+    /// <c>OnStartup</c> 里的组合根创建也必须被包住：调度器缺失与构造失败都发生在
+    /// 组合根 <c>StartAsync</c> 之前，漏掉它们等于多留一个静默失败点。
     /// </summary>
+    /// <remarks>
+    /// 【阶段 2 迁移】WinUI 的回调名是 <c>OnLaunched</c>，WPF 的对应物是 <c>OnStartup</c>。
+    /// </remarks>
     [Fact]
-    public void OnLaunchedRoutesEarlyFailuresToTheFatalFallback()
+    public void OnStartupRoutesEarlyFailuresToTheFatalFallback()
     {
         var source = RepositorySourceFile.Read(AppRelativePath);
 
-        var body = RepositorySourceFile.ExtractMethodBody(source, "protected override void OnLaunched(");
+        var body = RepositorySourceFile.ExtractMethodBody(source, "protected override void OnStartup(");
 
         Assert.False(
             string.IsNullOrEmpty(body),
-            "App.xaml.cs 中找不到 OnLaunched 方法体，无法核对启动早期失败的兜底。");
+            "App.xaml.cs 中找不到 OnStartup 方法体，无法核对启动早期失败的兜底。");
 
         Assert.True(
-            Regex.IsMatch(body!, @"catch\s*\(\s*Exception\s+\w+\s*\)\s*\{[\s\S]*?ReportFatalErrorAndExit\s*\(",
+            Regex.IsMatch(
+                body!,
+                @"catch\s*\(\s*Exception\s+\w+\s*\)\s*\{[\s\S]*?ReportFatalErrorAndExitAsync\s*\(\s*ex\s*\)",
                 RegexOptions.CultureInvariant),
-            "OnLaunched 没有把调度器/组合根创建阶段的异常交给兜底路径。");
+            "OnStartup 没有把调度器/组合根创建阶段的异常交给兜底路径。");
 
-        Assert.Contains("ReportFatalErrorAndExit(ex)", body, StringComparison.Ordinal);
+        // 组合根必须建在 try 里：它一旦抛错，后面所有兜底接线都无从谈起。
+        Assert.True(
+            Regex.IsMatch(body!, @"try\s*\{[\s\S]*?new\s+AppCompositionRoot\s*\(", RegexOptions.CultureInvariant),
+            "AppCompositionRoot 的构造不在 OnStartup 的 try 之内，构造期异常会逃逸成静默失败。");
     }
 
     /// <summary>
     /// <c>StartAsync</c> 的 catch 必须真的包住 <c>root.StartAsync()</c>，
-    /// 并把异常交给 <see cref="ReportFatalErrorAsync"/> 而不是只写 Trace。
+    /// 并把异常交给兜底路径而不是只写 Trace。
     /// </summary>
+    /// <remarks>
+    /// 【阶段 2 迁移】兜底方法是实例方法（要经 <c>Dispatcher</c> 回到 UI 线程），
+    /// 因此 <c>StartAsync</c> 也随之从 static 变成实例方法。
+    /// </remarks>
     [Fact]
     public void StartAsyncCatchesAndReportsStartupFailures()
     {
         var source = RepositorySourceFile.Read(AppRelativePath);
 
-        var body = RepositorySourceFile.ExtractMethodBody(source, "private static async Task StartAsync(");
+        var body = RepositorySourceFile.ExtractMethodBody(source, "private async Task StartAsync(");
 
         Assert.False(
             string.IsNullOrEmpty(body),
@@ -141,21 +179,25 @@ public sealed class FatalStartupVisibilityTests
         var tryIndex = body!.IndexOf("try", StringComparison.Ordinal);
         var awaitedIndex = body.IndexOf("await root.StartAsync()", StringComparison.Ordinal);
         var catchIndex = body.IndexOf("catch", StringComparison.Ordinal);
-        var reportIndex = body.IndexOf("await ReportFatalErrorAsync(", StringComparison.Ordinal);
+        var reportIndex = body.IndexOf("await ReportFatalErrorAndExitAsync(", StringComparison.Ordinal);
 
         Assert.True(tryIndex >= 0, "StartAsync 没有 try。");
         Assert.True(awaitedIndex > tryIndex, "root.StartAsync() 不在 try 之内，启动异常会逃逸成无人观察的任务异常。");
         Assert.True(catchIndex > awaitedIndex, "catch 不在 root.StartAsync() 之后，捕获范围不覆盖启动本身。");
-        Assert.True(reportIndex > catchIndex, "catch 没有把异常交给 ReportFatalErrorAsync 上报。");
+        Assert.True(reportIndex > catchIndex, "catch 没有把异常交给 ReportFatalErrorAndExitAsync 上报。");
     }
 
     /// <summary>
     /// 兜底对话框必须真的调 Win32 <c>MessageBoxW</c>，且调用被平台判定与 try/catch 包住。
     /// </summary>
     /// <remarks>
-    /// <c>MessageBoxW</c> 不依赖 XAML/WinRT 对象图，因此"窗口还没建起来"时仍然可用——
-    /// 这正是它存在的理由。反过来，<c>ContentDialog</c> 必须挂在 <c>XamlRoot</c> 上，
+    /// <c>MessageBoxW</c> 不依赖 WPF/WinRT 对象图，因此"窗口还没建起来"时仍然可用——
+    /// 这正是它存在的理由。反过来，任何 WPF 对话框都必须先有窗口承载，
     /// 在这条路径上永远显示不出来。
+    /// <para>
+    /// 【阶段 2 迁移】平台判定从 <c>OperatingSystem.IsWindows()</c>（.NET 5+）
+    /// 换成 net48 上真实存在的 <c>RuntimeInformation.IsOSPlatform(OSPlatform.Windows)</c>。
+    /// </para>
     /// </remarks>
     [Fact]
     public void FatalErrorDialogUsesGuardedWin32MessageBox()
@@ -181,8 +223,11 @@ public sealed class FatalStartupVisibilityTests
             "FatalErrorDialog.cs 中找不到 Show 方法体，无法核对 Win32 调用是否被兜住。");
 
         Assert.True(
-            Regex.IsMatch(body!, @"OperatingSystem\.IsWindows\s*\(\s*\)", RegexOptions.CultureInvariant),
-            "Show 没有按 OperatingSystem.IsWindows() 降级，非 Windows 平台上会直接抛。");
+            Regex.IsMatch(
+                body!,
+                @"RuntimeInformation\.IsOSPlatform\s*\(\s*OSPlatform\.Windows\s*\)",
+                RegexOptions.CultureInvariant),
+            "Show 没有按 RuntimeInformation.IsOSPlatform(OSPlatform.Windows) 降级，非 Windows 平台上会直接抛。");
 
         Assert.True(
             Regex.IsMatch(body!, @"catch\s*\(\s*Exception\s+\w+\s*\)", RegexOptions.CultureInvariant),

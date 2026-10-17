@@ -9,9 +9,10 @@
 
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <!-- Windows 10 1703+ / Windows 11：逐显示器 DPI 感知 -->
+      <!-- Windows 10 1703+ / Windows 11：逐显示器 DPI 感知。
+           WinUI 3 与 WPF 都走同一套 Win32 声明，迁移后无需改动。 -->
       <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
-      <!-- TargetPlatformMinVersion 为 10.0.17763，低于 19041 的系统回落到旧版声明 -->
+      <!-- 老式声明，作为不认识 dpiAwareness 的系统回落 -->
       <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/PM</dpiAware>
       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
       <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>

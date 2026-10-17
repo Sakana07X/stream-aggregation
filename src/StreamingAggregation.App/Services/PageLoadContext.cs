@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using StreamingAggregation.Core.Diagnostics;
 
 namespace StreamingAggregation.App.Services;
 
@@ -9,7 +10,7 @@ namespace StreamingAggregation.App.Services;
 /// <remarks>
 /// <para>
 /// <b>为什么需要它</b>：存储层的任务（SQLite 往返）会在线程池上继续，若在 <c>await</c> 之后
-/// 直接给 <c>ItemsSource</c> 赋值，更新就可能落在非 UI 线程上，WinUI 会当场抛
+/// 直接给 <c>ItemsSource</c> 赋值，更新就可能落在非 UI 线程上，WPF 会当场抛
 /// <see cref="System.Runtime.InteropServices.COMException"/>（RPC_E_WRONG_THREAD）。
 /// 页面构造时把组合根的封送委托交进来，更新就一定回到 UI 线程；
 /// 没给封送委托时（无 UI 场景）就地执行，与 <c>ConnectionStatusViewModel</c> 的约定一致。
@@ -22,6 +23,10 @@ namespace StreamingAggregation.App.Services;
 /// 刻意<b>不</b>在这里做取消与生命周期：每个页面都是短生命周期的视图对象，
 /// 而 SQLite 查询是本地毫秒级往返，为此引入 <see cref="System.Threading.CancellationTokenSource"/>
 /// 的所有权与释放时机会把复杂度抬到收益之上。真正需要终止的是整条消息管线，它由组合根负责。
+/// </para>
+/// <para>
+/// <b>阶段 2 状态</b>：四个页面仍未迁到 WPF，本类型暂时没有调用方，
+/// 但参数校验已按 net48 可用的 <see cref="Guard"/> 改写，阶段 3 页面回归编译即可直接用。
 /// </para>
 /// </remarks>
 internal sealed class PageLoadContext
@@ -37,7 +42,7 @@ internal sealed class PageLoadContext
     /// </param>
     public PageLoadContext(string pageName, Action<Action>? marshalToUi = null)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(pageName);
+        Guard.NotNullOrWhiteSpace(pageName);
 
         PageName = pageName;
         _marshal = marshalToUi ?? (static action => action());
@@ -50,13 +55,13 @@ internal sealed class PageLoadContext
     /// 在 UI 线程上执行一段界面更新。
     /// </summary>
     /// <remarks>
-    /// 调用方<b>不要</b>直接给任何 WinUI 属性赋值，否则就绕开了封送通道——
+    /// 调用方<b>不要</b>直接给任何 WPF 元素属性赋值，否则就绕开了封送通道——
     /// 这正是 <c>PageLoadContextTests</c> 要盯住的回归。
     /// </remarks>
     /// <param name="update">界面更新动作。</param>
     public void Apply(Action update)
     {
-        ArgumentNullException.ThrowIfNull(update);
+        Guard.NotNull(update);
 
         _marshal(update);
     }

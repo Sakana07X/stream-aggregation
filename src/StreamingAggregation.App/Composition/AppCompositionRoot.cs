@@ -4,15 +4,15 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.UI.Xaml;
-using Microsoft.UI.Xaml.Controls;
-using StreamingAggregation.App.Pages;
+using System.Windows;
+using System.Windows.Controls;
 using StreamingAggregation.App.Services;
 using StreamingAggregation.App.ViewModels;
 using StreamingAggregation.Core;
 using StreamingAggregation.Core.Abstractions;
 using StreamingAggregation.Core.Aggregation;
 using StreamingAggregation.Core.Configuration;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Filtering;
 using StreamingAggregation.Infrastructure;
 using StreamingAggregation.Infrastructure.Aggregation;
@@ -61,7 +61,7 @@ public sealed class AppCompositionRoot : IDisposable
     private CancellationTokenSource? _connectionScope;
     private OneBotWebSocketClient? _eventSource;
     private Task? _pipelineTask;
-    private Window? _mainWindow;
+    private MainWindow? _mainWindow;
     private TrayIconService? _tray;
     private bool _disposed;
 
@@ -69,9 +69,9 @@ public sealed class AppCompositionRoot : IDisposable
     /// 创建组合根并完成全部服务登记（不启动任何后台工作）。
     /// </summary>
     /// <param name="marshalToUi">
-    /// 把一段动作搬到 UI 线程执行的封送委托（<c>DispatcherQueue.TryEnqueue</c>），
-    /// 返回 <see langword="false"/> 表示调度器已关闭。为 <see langword="null"/> 时就地执行——
-    /// 组合根的单元测试不需要真实消息循环。
+    /// 把一段动作搬到 UI 线程执行的封送委托（WPF <c>Dispatcher.BeginInvoke</c> 语义：
+    /// 永不内联，调度器已关闭时返回 <see langword="false"/>）。
+    /// 为 <see langword="null"/> 时就地执行——组合根的单元测试不需要真实消息循环。
     /// </param>
     public AppCompositionRoot(Func<Action, bool>? marshalToUi = null)
     {
@@ -104,14 +104,11 @@ public sealed class AppCompositionRoot : IDisposable
     /// <summary>暂停/恢复开关，托盘与管线共用同一份状态。</summary>
     public PauseResumeService PauseResume { get; } = new();
 
-    /// <summary>
-    /// 主窗口的 XAML 根；窗口尚未创建时为 <see langword="null"/>。
-    /// </summary>
-    /// <remarks>
-    /// <see cref="ContentDialog"/> 必须挂在一个 <see cref="XamlRoot"/> 上才能显示，
-    /// 启动早期要用它来报致命错误。
-    /// </remarks>
-    public XamlRoot? MainWindowRoot => (_mainWindow?.Content as FrameworkElement)?.XamlRoot;
+    // 【阶段 2】原来的 MainWindowRoot（XamlRoot）已整体删除：
+    // 它唯一的用途是让启动早期的 ContentDialog 找到可挂载的界面根，而 WPF 版致命错误
+    // 统一走 Win32 MessageBox（见 FatalErrorDialog），不再需要界面根。
+    // 主窗口的持有者始终是下面的 _mainWindow 字段，不要为它另开公开访问口——
+    // 那样等于允许调用方在窗口还没建好时就去碰界面元素。
 
     /// <summary>
     /// 按"连接先起、窗口后开"的顺序启动应用。
@@ -122,7 +119,7 @@ public sealed class AppCompositionRoot : IDisposable
     /// </remarks>
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        Guard.ThrowIfDisposed(_disposed, nameof(AppCompositionRoot));
 
         EnsureCoreInterfacesRegistered();
         await InitializeCoreAsync(cancellationToken).ConfigureAwait(false);
@@ -130,10 +127,10 @@ public sealed class AppCompositionRoot : IDisposable
         // ① 连接先起：管线在后台跑起来，状态变化会实时推到连接状态绑定。
         StartConnection(cancellationToken);
 
-        // ② 窗口后开：回到 UI 线程创建并激活窗口与托盘。
+        // ② 窗口后开：回到 UI 线程创建并显示窗口与托盘。
         if (!TryMarshal(ShowMainWindow))
         {
-            Log(PipelineLogLevel.Error, "UI 调度队列已关闭，主窗口无法显示。");
+            Log(PipelineLogLevel.Error, "界面调度队列已关闭，主窗口无法显示。");
         }
     }
 
@@ -206,7 +203,10 @@ public sealed class AppCompositionRoot : IDisposable
         _tray?.Dispose();
         _tray = null;
 
-        _mainWindow?.Close();
+        // RequestClose 而不是 Close()：托盘常驻模式下 Close() 会被 MainWindow 的 Closing
+        // 拦截改成「隐藏」，那样 Dispose 跑完了进程还留着，就永远退不出。
+
+        _mainWindow?.RequestClose();
         _mainWindow = null;
 
         var running = _pipelineTask;
@@ -443,11 +443,23 @@ public sealed class AppCompositionRoot : IDisposable
             ? _settings.Aggregation.WindowMinutes
             : AggregationOptions.DefaultWindowMinutes;
 
-    /// <summary>在 UI 线程上创建窗口、托盘并激活窗口。</summary>
+    /// <summary>
+    /// 在 UI 线程上创建窗口、托盘并显示窗口。
+    /// </summary>
+    /// <remarks>
+    /// 【阶段 2 变化】WinUI 3 的 <c>Window.Activate()</c> 在 WPF 里只能激活已可见的窗口，
+    /// 首次显示必须 <c>Show()</c>。托盘「打开窗口」那条路径两者都要（见 <c>TrayIconService</c>），
+    /// 这里只负责首次显示。
+    /// </remarks>
     private void ShowMainWindow()
     {
         if (_mainWindow is not null)
         {
+            if (!_mainWindow.IsVisible)
+            {
+                _mainWindow.Show();
+            }
+
             _mainWindow.Activate();
             return;
         }
@@ -466,31 +478,27 @@ public sealed class AppCompositionRoot : IDisposable
         ConnectionStatus.StatusChanged += OnConnectionStatusChanged;
         _tray.UpdateConnectionState(ConnectionStatus.State);
 
-        _mainWindow.Activate();
+        _mainWindow.Show();
     }
 
-    /// <summary>构造页面并注入视图模型。</summary>
+    /// <summary>
+    /// 构造页面并注入视图模型。
+    /// </summary>
     /// <remarks>
-    /// 存储与封送委托一起注入：页面读取数据在线程池上继续，只有拿到 <see cref="QueueOnUiThread"/>
-    /// 才能把结果安全地搬回 UI 线程，否则首屏加载就会以 RPC_E_WRONG_THREAD 崩掉。
+    /// 【阶段 2 TODO】四个页面的 XAML 仍在用 WinUI 专有控件（NavigationView / NumberBox /
+    /// InfoBar / ContentDialog），WPF 里都没有对应物，因此这些页面暂时被 csproj 排除在编译之外，
+    /// 具体的构造分支也一并摘掉。阶段 3/4 完成控件替换后，把分支原样加回来即可，
+    /// <see cref="AppShell.PageFactory"/> 的 <c>Func&lt;Type, Page&gt;</c> 签名不变。
     /// </remarks>
     /// <param name="pageType">页面类型。</param>
     /// <returns>页面实例。</returns>
+    /// <exception cref="NotSupportedException">阶段 2 尚未迁移任何页面。</exception>
     private Page CreatePage(Type pageType)
     {
-        ArgumentNullException.ThrowIfNull(pageType);
+        Guard.NotNull(pageType);
 
-        return pageType switch
-        {
-            var type when type == typeof(SettingsPage) => new SettingsPage(SettingsViewModel),
-            var type when type == typeof(DigestPage) =>
-                new DigestPage(_services.Resolve<IDigestStore>(), QueueOnUiThread),
-            var type when type == typeof(TodoPage) =>
-                new TodoPage(_services.Resolve<ITaskStore>(), QueueOnUiThread),
-            var type when type == typeof(MessagesPage) =>
-                new MessagesPage(_services.Resolve<IMessageStore>(), QueueOnUiThread),
-            _ => throw new NotSupportedException($"未注册页面类型 {pageType.FullName}。"),
-        };
+        throw new NotSupportedException(
+            $"页面 {pageType.FullName} 尚未迁移到 WPF（阶段 3/4 处理），当前构建里没有已注册的页面类型。");
     }
 
     /// <summary>把事件源的状态变化推给界面与托盘。</summary>
@@ -524,7 +532,7 @@ public sealed class AppCompositionRoot : IDisposable
     /// <param name="saved">已落库的设置。</param>
     private void OnSettingsSaved(object? sender, AppSettings saved)
     {
-        ArgumentNullException.ThrowIfNull(saved);
+        Guard.NotNull(saved);
 
         _settings = saved;
         HandleSettingsChanged();
@@ -539,8 +547,26 @@ public sealed class AppCompositionRoot : IDisposable
         StartConnection(_shutdown.Token);
     }
 
-    /// <summary>退出应用：释放组合根（会顺带关窗、停管线、停托盘）。</summary>
-    private void ExitApplication() => Dispose();
+    /// <summary>
+    /// 退出应用：先让主窗口真正关闭，再请求 <see cref="Application"/> 结束消息循环。
+    /// </summary>
+    /// <remarks>
+    /// 【阶段 2 变化】WinUI 3 里没有"关窗即退出"的对立面，<c>Dispose()</c> 走完进程就结束了。
+    /// WPF 默认 <see cref="ShutdownMode.OnExplicitShutdown"/> 时关窗只是隐藏，
+    /// <see cref="Dispose"/> 跑完进程照样活着——所以必须显式 <see cref="Application.Shutdown()"/>。
+    /// 顺序也不可颠倒：窗口的 <c>Closing</c> 会拦截普通 <c>Close()</c>，
+    /// 因此先 <see cref="MainWindow.RequestClose"/> 再 Shutdown。
+    /// <para>
+    /// 资源释放本身仍由 <see cref="App"/> 挂在 <see cref="Application.Exit"/> 上完成，
+    /// 这里只负责把退出流程推起来，不重复释放——那样会与 Exit 里的 Dispose 打架。
+    /// </para>
+    /// </remarks>
+    private void ExitApplication()
+    {
+        _mainWindow?.RequestClose();
+
+        Application.Current?.Shutdown();
+    }
 
     /// <summary>按设置的保留天数清理过期数据；失败只记日志，不影响启动。</summary>
     /// <param name="cancellationToken">取消令牌。</param>
@@ -578,15 +604,16 @@ public sealed class AppCompositionRoot : IDisposable
     /// <returns>操作的任务。</returns>
     private Task RunOnUiAsync(Func<CancellationToken, Task> operation, CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(operation);
+        Guard.NotNull(operation);
 
         if (_marshalToUi is null)
         {
             return operation(cancellationToken);
         }
 
-        // TryEnqueue 没有返回值，只能用 TaskCompletionSource 把操作的结果接回来。
-        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // WPF 的 Dispatcher.BeginInvoke 没有返回值，只能用 TaskCompletionSource 把操作的
+        // 结果接回来。这里必须用泛型版本：net48 没有无参 TaskCompletionSource（非泛型是 .NET 5 才有的）。
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var queued = TryMarshal(() =>
         {
@@ -605,7 +632,7 @@ public sealed class AppCompositionRoot : IDisposable
     /// <returns>已排队（或已就地执行）返回 <see langword="true"/>；调度器已关闭返回 <see langword="false"/>。</returns>
     private bool TryMarshal(Action action)
     {
-        ArgumentNullException.ThrowIfNull(action);
+        Guard.NotNull(action);
 
         return _marshalToUi?.Invoke(action) ?? ExecuteInline(action);
     }
@@ -630,12 +657,12 @@ public sealed class AppCompositionRoot : IDisposable
     /// <param name="running">实际操作的任务。</param>
     /// <param name="completion">等待方的完成源。</param>
     /// <returns>可等待的任务。</returns>
-    private static async Task ForwardAsync(Task running, TaskCompletionSource completion)
+    private static async Task ForwardAsync(Task running, TaskCompletionSource<bool> completion)
     {
         try
         {
             await running.ConfigureAwait(false);
-            completion.SetResult();
+            completion.SetResult(true);
         }
         catch (Exception ex)
         {

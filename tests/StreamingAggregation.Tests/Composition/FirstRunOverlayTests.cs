@@ -1,28 +1,31 @@
+using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using StreamingAggregation.Tests.Fixtures;
 
 namespace StreamingAggregation.Tests.Composition;
 
 /// <summary>
-/// 源码断言：首启遮罩层必须真的存在且接线正确。
+/// 源码断言：主窗口壳、首启遮罩层与导航壳在当前阶段各自该做到哪一步。
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>为什么是源码断言</b>：<see cref="MainWindow"/> 是 WinUI 3 类型，测试宿主加载
-/// <c>StreamingAggregation.App</c> 需要 XAML/WinRT 运行时（同
-/// <see cref="CoreInterfaceCoverageTests"/> 的说明）。因此"遮罩层是否存在、按钮是否接线"
+/// <b>为什么是源码断言</b>：<see cref="MainWindow"/> 是 WPF 类型，测试宿主加载
+/// <c>StreamingAggregation.App</c> 需要 STA 线程与 WPF 消息泵（同
+/// <see cref="CoreInterfaceCoverageTests"/> 的说明）。因此"壳里有什么、遮罩层接线对不对"
 /// 退化为对 XAML 与代码后置文件的源码核对。
 /// </para>
 /// <para>
-/// <b>这些断言各挡什么回归</b>：
+/// <b>阶段 2 迁移（WinUI 3 → WPF/net48）后的分工</b>：
 /// <list type="bullet">
-/// <item>从 XAML 里删掉 <c>WelcomeOverlay</c>（遮罩层消失，首启引导静默失效）；</item>
-/// <item>删掉按钮的 <c>Click</c> 接线（按钮看得见但点了没反应）；</item>
-/// <item>把 <c>LaterButton_Click</c> 里的 <c>DismissAsync</c> 调用删掉
-/// （用户每次启动都被欢迎页挡住）；</item>
-    /// <item>忘设窗口初始尺寸（尺寸由 WinUI 默认决定，遮罩层布局不可控）。</item>
-/// 遮罩层布局不可控）。</item>
+/// <item><description>窗口标题、初始尺寸、关闭语义——<b>本阶段交付</b>，由本类断言锁死。</description></item>
+/// <item><description>导航壳（WinUI <c>NavigationView</c> 在 WPF 里没有对应物）与
+/// 首启遮罩层——<b>阶段 3/4 交付</b>；本阶段只要求"没有半迁移的 WinUI 残留"，
+/// 由 <see cref="NoWinUiResidueRemainsInTheWindowShell"/> 守住。</description></item>
+/// <item><description>遮罩层依赖的首启状态链路（<see cref="FirstRunState"/> → <c>AppShell</c> →
+/// 组合根）—— <b>本阶段已经就绪</b>，遮罩层接上去时不必回头改这层。</description></item>
 /// </list>
+/// 阶段 3/4 落地时，请把 <see cref="NavigationShellAndWelcomeOverlayAreDeferred"/>
+/// 一并替换回真实的遮罩层断言，不要让它留在"断言缺失"的状态上。
 /// </para>
 /// </remarks>
 public sealed class FirstRunOverlayTests
@@ -33,6 +36,16 @@ public sealed class FirstRunOverlayTests
     /// <summary><c>MainWindow.xaml.cs</c> 相对仓库根的路径。</summary>
     private const string MainWindowCodeBehindRelativePath =
         "src/StreamingAggregation.App/MainWindow.xaml.cs";
+
+    /// <summary><c>App.xaml</c> 相对仓库根的路径。</summary>
+    private const string AppXamlRelativePath = "src/StreamingAggregation.App/App.xaml";
+
+    /// <summary><c>App.xaml.cs</c> 相对仓库根的路径。</summary>
+    private const string AppCodeBehindRelativePath = "src/StreamingAggregation.App/App.xaml.cs";
+
+    /// <summary><c>ShutdownModeResolver.cs</c> 相对仓库根的路径。</summary>
+    private const string ShutdownModeResolverRelativePath =
+        "src/StreamingAggregation.App/Services/ShutdownModeResolver.cs";
 
     /// <summary><c>AppShell.cs</c> 相对仓库根的路径。</summary>
     private const string AppShellRelativePath = "src/StreamingAggregation.App/Composition/AppShell.cs";
@@ -109,153 +122,262 @@ public sealed class FirstRunOverlayTests
             "ShowMainWindow 未把 FirstRun 传给 AppShell，主窗口拿不到首启状态。");
     }
 
-    /// <summary><c>MainWindow.xaml</c> 必须声明 <c>WelcomeOverlay</c>，且遮罩层在 NavigationView 之后声明（Z 轴在上层）。</summary>
-    [Fact]
-    public void MainWindowXamlDeclaresWelcomeOverlayAboveNavigationView()
-    {
-        var source = RepositorySourceFile.Read(MainWindowRelativePath);
-
-        // WelcomeOverlay 必须存在
-        Assert.True(
-            Regex.IsMatch(source, @"x:Name=""WelcomeOverlay""", RegexOptions.CultureInvariant),
-            "MainWindow.xaml 缺少 WelcomeOverlay，首启遮罩层不存在。");
-
-        // 遮罩层必须在 NavigationView 之后声明（XAML 中后声明的元素在 Z 轴上层）
-        var navViewIndex = source.IndexOf("<NavigationView", StringComparison.Ordinal);
-        var overlayIndex = source.IndexOf("x:Name=\"WelcomeOverlay\"", StringComparison.Ordinal);
-
-        Assert.True(navViewIndex >= 0, "MainWindow.xaml 缺少 NavigationView。");
-        Assert.True(
-            overlayIndex > navViewIndex,
-            "WelcomeOverlay 必须在 NavigationView 之后声明，否则遮罩层会被导航栏挡住。");
-
-        // 遮罩层默认隐藏
-        Assert.True(
-            Regex.IsMatch(source, @"x:Name=""WelcomeOverlay""[^>]*Visibility=""Collapsed""", RegexOptions.CultureInvariant),
-            "WelcomeOverlay 默认必须是 Collapsed，非首启时不应遮挡界面。");
-
-        // 遮罩层必须有标题
-        Assert.True(
-            Regex.IsMatch(source, @"Text=""欢迎使用流式聚合""", RegexOptions.CultureInvariant),
-            "遮罩层缺少标题「欢迎使用流式聚合」。");
-
-        // 遮罩层必须包含三步引导文案
-        Assert.Contains("启动 SnowLuma", source, StringComparison.Ordinal);
-        Assert.Contains("群白名单", source, StringComparison.Ordinal);
-        Assert.Contains("Endpoint", source, StringComparison.Ordinal);
-
-        // 两个按钮必须存在并接线
-        Assert.True(
-            Regex.IsMatch(source, @"x:Name=""StartConfigButton""[^>]*Click=""StartConfigButton_Click""", RegexOptions.CultureInvariant),
-            "遮罩层缺少「开始配置」按钮或未接线 Click。");
-
-        Assert.True(
-            Regex.IsMatch(source, @"x:Name=""LaterButton""[^>]*Click=""LaterButton_Click""", RegexOptions.CultureInvariant),
-            "遮罩层缺少「稍后再说」按钮或未接线 Click。");
-    }
-
-/// <summary>
-    /// 窗口初始尺寸必须真的被设置，否则遮罩层布局不可控。
+    /// <summary>
+    /// 窗口标题与初始尺寸必须都在 XAML/代码后置里各有唯一一处来源，且不再碰 WinAppSDK 的 <c>AppWindow</c>。
     /// </summary>
     /// <remarks>
-    /// <b>为什么断言代码后置而不是 XAML</b>：WinUI 3 的 <c>Window</c> 没有
-    /// <c>Width</c>/<c>Height</c> 属性。把它们写进 XAML，XAML 编译器会报
-    /// WMC0011「Unknown member」并直接终止编译——而且 Windows App SDK 1.7 的编译器
-    /// 在独立进程模式下会把这个错误吞掉，只留下一个没有任何说明的退出码 1。因此初始
-    /// 尺寸只能在运行时经 <c>AppWindow.Resize</c> 设置。
+    /// <b>为什么尺寸断言 XAML 而不是代码后置</b>（与 WinUI 时代相反）：
+    /// WinUI 3 的 <c>Window</c> 没有 <c>Width</c>/<c>Height</c> 属性，写进 XAML 会被
+    /// XAML 编译器判为 WMC0011「Unknown member」并终止编译，因此当时只能在运行期经
+    /// <c>AppWindow.Resize</c> 设置。WPF 的 <c>Window</c> 是普通依赖属性，
+    /// 直接写在 XAML 里就是唯一一处来源——也正因为如此，
+    /// 「代码后置里不再出现 <c>AppWindow.Resize</c> / <c>ExtendsContentIntoTitleBar</c>」
+    /// 才是一条值得锁死的断言：它们是迁移漏网的直接证据。
+    /// <para>
+    /// 标题则相反，刻意留在代码后置：它是 <see cref="MainWindow"/> 构造时的运行期事实，
+    /// 写进 XAML 会和 <c>Shell</c> 的初始化顺序割裂。这条断言只要求<b>只有一处</b>，
+    /// 两边都写迟早会漂移。
+    /// </para>
     /// </remarks>
     [Fact]
-    public void MainWindowSetsInitialWindowSize()
+    public void MainWindowDeclaresItsShellPropertiesInOnePlace()
     {
         var xaml = RepositorySourceFile.Read(MainWindowRelativePath);
-
-        Assert.False(
-            Regex.IsMatch(xaml, @"<Window[^>]*\bWidth=", RegexOptions.CultureInvariant),
-            "WinUI 3 的 Window 没有 Width 属性，写进 XAML 会让 XAML 编译失败（WMC0011）。");
-
         var codeBehind = RepositorySourceFile.Read(MainWindowCodeBehindRelativePath);
 
-        Assert.True(
-            Regex.IsMatch(codeBehind, @"\.Resize\(new\s+Windows\.Graphics\.SizeInt32\(", RegexOptions.CultureInvariant),
-            "MainWindow 未调用 AppWindow.Resize，窗口尺寸由 WinUI 默认决定，遮罩层布局不可控。");
+        // ── 初始尺寸：XAML 声明 ──
+        var windowTag = Regex.Match(xaml, @"<Window\b[^>]*>", RegexOptions.CultureInvariant);
+        Assert.True(windowTag.Success, "MainWindow.xaml 找不到 <Window> 根元素。");
 
         Assert.True(
-            Regex.IsMatch(codeBehind, @"InitialWindowWidth\s*=\s*\d+", RegexOptions.CultureInvariant)
-            && Regex.IsMatch(codeBehind, @"InitialWindowHeight\s*=\s*\d+", RegexOptions.CultureInvariant),
-            "MainWindow 未定义有效的 InitialWindowWidth/InitialWindowHeight。");
+            Regex.IsMatch(windowTag.Value, @"\bWidth\s*=\s*""1100""", RegexOptions.CultureInvariant),
+            "MainWindow.xaml 的 <Window> 必须声明 Width=\"1100\"（设备无关像素）。");
+
+        Assert.True(
+            Regex.IsMatch(windowTag.Value, @"\bHeight\s*=\s*""720""", RegexOptions.CultureInvariant),
+            "MainWindow.xaml 的 <Window> 必须声明 Height=\"720\"（设备无关像素）。");
+
+        // ── 标题：代码后置声明，且只有这一处 ──
+        Assert.True(
+            Regex.IsMatch(codeBehind, @"Title\s*=\s*""流式聚合""", RegexOptions.CultureInvariant),
+            "MainWindow.xaml.cs 没有把窗口标题设为「流式聚合」。");
+
+        Assert.False(
+            Regex.IsMatch(xaml, @"\bTitle\s*=", RegexOptions.CultureInvariant),
+            "MainWindow.xaml 又声明了一遍 Title，与代码后置形成两处真相，迟早漂移。");
+
+        // ── 不得残留 Windows App SDK 的窗口 API ──
+        foreach (var winAppSdkCall in new[]
+                 {
+                     @"\.Resize\s*\(",
+                     @"Windows\.Graphics\.SizeInt32",
+                     @"ExtendsContentIntoTitleBar",
+                     @"SetTitleBar\s*\(",
+                     @"AppWindow",
+                 })
+        {
+            Assert.False(
+                Regex.IsMatch(codeBehind, winAppSdkCall, RegexOptions.CultureInvariant),
+                $"MainWindow.xaml.cs 仍在使用 Windows App SDK 的 {winAppSdkCall}，" +
+                "WPF 窗口尺寸与标题栏都由 XAML / 原生标题栏负责。");
+        }
     }
 
     /// <summary>
-    /// <c>NavView_Loaded</c> 必须根据 <c>FirstRun.IsFirstRun</c> 决定遮罩可见性与初始导航。
+    /// 窗口壳里不允许残留任何 WinUI 专有写法（阶段 2 的"没迁干净"检测）。
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 这是本阶段唯一一条<b>断言"不存在"</b>的测试，但它挡的是本次迁移最容易犯的错：
+    /// 把 WinUI 的 XAML 原样留着、只改 C#。那样子编译能过（因为 <c>Pages\**</c> 已被排除），
+    /// 却在阶段 3 打开编译时集中爆雷。
+    /// </para>
+    /// <para>
+    /// 同时把"导航壳与遮罩层尚未交付"这件事钉成显式的 TODO 标记：
+    /// 阶段 3/4 接手的人能一眼看出哪里还欠着，而不是去翻变更记录。
+    /// </para>
+    /// </remarks>
     [Fact]
-    public void NavViewLoadBranchesOnFirstRunState()
+    public void NoWinUiResidueRemainsInTheWindowShell()
     {
-        var source = RepositorySourceFile.Read(MainWindowCodeBehindRelativePath);
+        var sources = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["MainWindow.xaml"] = RepositorySourceFile.Read(MainWindowRelativePath),
+            ["MainWindow.xaml.cs"] = RepositorySourceFile.Read(MainWindowCodeBehindRelativePath),
+            ["App.xaml"] = RepositorySourceFile.Read(AppXamlRelativePath),
+            ["App.xaml.cs"] = RepositorySourceFile.Read(AppCodeBehindRelativePath),
+        };
 
-        var body = RepositorySourceFile.ExtractMethodBody(source, "private void NavView_Loaded(");
-        Assert.False(
-            string.IsNullOrEmpty(body),
-            "MainWindow.xaml.cs 中找不到 NavView_Loaded 方法体，无法核对首启分支。");
+        var forbidden = new[]
+        {
+            @"Microsoft\.UI\.",
+            @"using:Microsoft\.UI",
+            @"NavigationView",
+            @"ThemeResource",
+            @"XamlControlsResources",
+            @"x:Bind",
+            @"\bXamlRoot\b",
+            @"Window\.AppWindow",
+        };
 
-        Assert.True(
-            Regex.IsMatch(body!, @"FirstRun\.IsFirstRun", RegexOptions.CultureInvariant),
-            "NavView_Loaded 未判断 FirstRun.IsFirstRun，遮罩层不会按首启状态显示。");
+        // KeyValuePair.Deconstruct 是 .NET Core 2.0 才有的，net48 上只能显式取 Key/Value。
+        foreach (var file in sources)
+        {
+            // 注释必须先剥掉：迁移说明里本来就会提到「NavigationView 在 WPF 里没有对应物」
+            // 这类旧名词，扫的是代码而不是注释。
+            var code = StripComments(file.Value);
 
-        Assert.True(
-            Regex.IsMatch(body!, @"WelcomeOverlay\.Visibility\s*=\s*Visibility\.Visible", RegexOptions.CultureInvariant),
-            "首启时未显示 WelcomeOverlay，用户看不到引导。");
-
-        Assert.True(
-            Regex.IsMatch(body!, @"WelcomeOverlay\.Visibility\s*=\s*Visibility\.Collapsed", RegexOptions.CultureInvariant),
-            "非首启时未隐藏 WelcomeOverlay，遮罩层会一直挡在界面上。");
+            foreach (var pattern in forbidden)
+            {
+                Assert.False(
+                    Regex.IsMatch(code, pattern, RegexOptions.CultureInvariant),
+                    $"{file.Key} 里仍残留 WinUI 专有写法 {pattern}：WPF/net48 下它没有对应物或根本编译不过。");
+            }
+        }
     }
 
     /// <summary>
-    /// 「开始配置」按钮必须隐藏遮罩层并跳转到设置页。
+    /// 剥掉 XML 注释、行注释与块注释，只留下会被编译的代码。
     /// </summary>
-    [Fact]
-    public void StartConfigButtonHidesOverlayAndNavigatesToSettings()
+    /// <remarks>
+    /// 行注释的识别要避开协议里的 <c>//</c>（<c>https://</c>）：只有前面不是 <c>:</c> 的
+    /// <c>//</c> 才当注释起点。窗口壳这几个文件里没有带协议的字符串，
+    /// 这条启发式够用；真要严谨就得上 Roslyn，那超出源码断言这条路的成本。
+    /// </remarks>
+    /// <param name="source">源码或 XAML 全文。</param>
+    /// <returns>去掉注释后的文本。</returns>
+    private static string StripComments(string source)
     {
-        var source = RepositorySourceFile.Read(MainWindowCodeBehindRelativePath);
-
-        var body = RepositorySourceFile.ExtractMethodBody(source, "private void StartConfigButton_Click(");
-        Assert.False(
-            string.IsNullOrEmpty(body),
-            "MainWindow.xaml.cs 中找不到 StartConfigButton_Click 方法体，无法核对按钮行为。");
-
-        Assert.True(
-            Regex.IsMatch(body!, @"WelcomeOverlay\.Visibility\s*=\s*Visibility\.Collapsed", RegexOptions.CultureInvariant),
-            "「开始配置」未隐藏遮罩层。");
-
-        Assert.True(
-            Regex.IsMatch(body!, @"NavView\.MenuItems\s*\[\s*3\s*\]", RegexOptions.CultureInvariant),
-            "「开始配置」未跳转到设置页（MenuItems[3]）。");
+        var stripped = Regex.Replace(source, @"<!--[\s\S]*?-->", " ", RegexOptions.CultureInvariant);
+        stripped = Regex.Replace(stripped, @"/\*[\s\S]*?\*/", " ", RegexOptions.CultureInvariant);
+        return Regex.Replace(stripped, @"(?<!:)//[^\r\n]*", " ", RegexOptions.CultureInvariant);
     }
 
     /// <summary>
-    /// 「稍后再说」按钮必须隐藏遮罩层、调用 <c>DismissAsync</c> 持久化标记，并跳转到摘要页。
+    /// 导航壳与首启遮罩层尚未交付，必须以显式 TODO 标记留在窗口壳里。
     /// </summary>
+    /// <remarks>
+    /// 这是一条<b>阶段闸门</b>，不是功能断言：它保证"阶段 3/4 还欠导航壳和遮罩层"
+    /// 这件事不会随着阶段 2 的合并被人忘掉。等遮罩层真正落地时，
+    /// 请把本测试换回对 <c>WelcomeOverlay</c>、两个按钮接线与 <c>DismissAsync</c> 的断言。
+    /// </remarks>
     [Fact]
-    public void LaterButtonHidesOverlayPersistsFlagAndNavigatesToDigest()
+    public void NavigationShellAndWelcomeOverlayAreDeferred()
     {
-        var source = RepositorySourceFile.Read(MainWindowCodeBehindRelativePath);
+        var xaml = RepositorySourceFile.Read(MainWindowRelativePath);
+        var codeBehind = RepositorySourceFile.Read(MainWindowCodeBehindRelativePath);
 
-        var body = RepositorySourceFile.ExtractMethodBody(source, "private void LaterButton_Click(");
+        Assert.Contains("TODO(阶段 3)", xaml, StringComparison.Ordinal);
+        Assert.Contains("TODO(阶段 4)", xaml, StringComparison.Ordinal);
+        Assert.Contains("TODO(阶段 3)", codeBehind, StringComparison.Ordinal);
+
         Assert.False(
-            string.IsNullOrEmpty(body),
-            "MainWindow.xaml.cs 中找不到 LaterButton_Click 方法体，无法核对按钮行为。");
+            xaml.Contains("WelcomeOverlay", StringComparison.Ordinal),
+            "首启遮罩层仍留在 MainWindow.xaml：它属于阶段 4 的交付物，" +
+            "阶段 3 之前不该半迁移地留在窗口壳里。");
+
+        Assert.False(
+            codeBehind.Contains("StartConfigButton_Click", StringComparison.Ordinal)
+            || codeBehind.Contains("LaterButton_Click", StringComparison.Ordinal),
+            "遮罩层的按钮处理器仍留在 MainWindow.xaml.cs：阶段 4 会连同遮罩层一起补齐。");
+
+        // 但遮罩层所依赖的状态链路必须已经就绪，否则阶段 4 还要回头改组合根。
+        var firstRunState = RepositorySourceFile.Read(FirstRunStateRelativePath);
+        Assert.True(
+            Regex.IsMatch(firstRunState, @"Task\s+DismissAsync\s*\(", RegexOptions.CultureInvariant),
+            "FirstRunState.DismissAsync 缺失，阶段 4 的「稍后再说」没有持久化入口。");
+    }
+
+    /// <summary>
+    /// 关闭语义：托盘常驻模式下关窗只隐藏，「请求关闭」才真正关掉。
+    /// </summary>
+    /// <remarks>
+    /// 这条是阶段 2 的核心验收项（关窗后进程仍在、托盘仍在；托盘「退出」才结束进程），
+    /// 一旦 <c>Closing</c> 处理器被删掉或 <c>RequestClose</c> 被改名，
+    /// "关窗即退出"与"关窗即隐藏"两条路会同时失效且没有任何编译信号。
+    /// </remarks>
+    [Fact]
+    public void WindowCloseHidesInTrayResidentModeAndRequestCloseBypassesIt()
+    {
+        var codeBehind = RepositorySourceFile.Read(MainWindowCodeBehindRelativePath);
+
+        var closingBody = RepositorySourceFile.ExtractMethodBody(codeBehind, "private void OnClosing(");
+        Assert.False(
+            string.IsNullOrEmpty(closingBody),
+            "MainWindow.xaml.cs 中找不到 OnClosing 方法体，无法核对托盘常驻的关闭语义。");
 
         Assert.True(
-            Regex.IsMatch(body!, @"WelcomeOverlay\.Visibility\s*=\s*Visibility\.Collapsed", RegexOptions.CultureInvariant),
-            "「稍后再说」未隐藏遮罩层。");
+            Regex.IsMatch(closingBody!, @"e\.Cancel\s*=\s*true", RegexOptions.CultureInvariant),
+            "OnClosing 没有 e.Cancel = true：关窗会真的关掉窗口，进程可能被 ShutdownMode 带走。");
 
         Assert.True(
-            Regex.IsMatch(body!, @"FirstRun\.DismissAsync\s*\(", RegexOptions.CultureInvariant),
-            "「稍后再说」未调用 FirstRun.DismissAsync，二次启动仍会弹遮罩。");
+            Regex.IsMatch(closingBody!, @"\bHide\s*\(\s*\)", RegexOptions.CultureInvariant),
+            "OnClosing 没有 Hide()：窗口只是被取消关闭，仍然留在屏幕上挡住界面。");
 
         Assert.True(
-            Regex.IsMatch(body!, @"NavView\.MenuItems\s*\[\s*0\s*\]", RegexOptions.CultureInvariant),
-            "「稍后再说」未跳转到摘要页（MenuItems[0]）。");
+            Regex.IsMatch(
+                closingBody!,
+                @"ShutdownMode\s*==\s*ShutdownMode\.OnLastWindowClose",
+                RegexOptions.CultureInvariant),
+            "OnClosing 没有识别 ShutdownMode.OnLastWindowClose：「关窗即退出」模式会被常驻逻辑反向拦截。");
+
+        var requestCloseBody =
+            RepositorySourceFile.ExtractMethodBody(codeBehind, "public void RequestClose()");
+        Assert.False(
+            string.IsNullOrEmpty(requestCloseBody),
+            "MainWindow.xaml.cs 中找不到 RequestClose 方法体：托盘「退出」将退化成普通关窗，进程永远退不出。");
+
+        Assert.True(
+            Regex.IsMatch(requestCloseBody!, @"_allowClose\s*=\s*true", RegexOptions.CultureInvariant),
+            "RequestClose 没有置 _allowClose = true，仍然会被 OnClosing 拦截成隐藏。");
+    }
+
+    /// <summary>
+    /// 关闭模式必须可配置：XAML 不写死，<c>OnStartup</c> 委托给 <c>ShutdownModeResolver</c>。
+    /// </summary>
+    /// <remarks>
+    /// 托盘常驻（<c>OnExplicitShutdown</c>）是默认诉求，但「关窗即退出」对无障碍用户与
+    /// 远程桌面场景同样合理，因此这条配置点不能被 XAML 的一个属性写死。
+    /// </remarks>
+    [Fact]
+    public void ShutdownModeIsConfigurableRatherThanHardCoded()
+    {
+        var appXaml = RepositorySourceFile.Read(AppXamlRelativePath);
+        var appCodeBehind = RepositorySourceFile.Read(AppCodeBehindRelativePath);
+        var resolver = RepositorySourceFile.Read(ShutdownModeResolverRelativePath);
+
+        Assert.False(
+            Regex.IsMatch(appXaml, @"ShutdownMode\s*=", RegexOptions.CultureInvariant),
+            "App.xaml 把 ShutdownMode 写死了，运行期（命令行/环境变量）就再也切不过去。");
+
+        Assert.True(
+            Regex.IsMatch(
+                appCodeBehind,
+                @"ShutdownMode\s*=\s*ShutdownModeResolver\.Resolve\s*\(",
+                RegexOptions.CultureInvariant),
+            "App.OnStartup 没有把 ShutdownMode 交给 ShutdownModeResolver 决定。");
+
+        // 默认值必须仍是托盘常驻，且两处入口（命令行 / 环境变量）都在。
+        Assert.True(
+            Regex.IsMatch(
+                resolver,
+                @"\?\?\s*ShutdownMode\.OnExplicitShutdown",
+                RegexOptions.CultureInvariant),
+            "ShutdownModeResolver 的默认值不是 OnExplicitShutdown，关窗后进程不会留在托盘。");
+
+        Assert.True(
+            Regex.IsMatch(resolver, @"--exit-on-window-close", RegexOptions.CultureInvariant),
+            "ShutdownModeResolver 缺少「关窗即退出」命令行开关。");
+
+        Assert.True(
+            Regex.IsMatch(
+                resolver,
+                @"ShutdownMode\.OnLastWindowClose",
+                RegexOptions.CultureInvariant),
+            "ShutdownModeResolver 从未返回 OnLastWindowClose，配置入口形同虚设。");
+
+        Assert.True(
+            Regex.IsMatch(resolver, @"STREAMINGAGGREGATION_SHUTDOWN", RegexOptions.CultureInvariant),
+            "ShutdownModeResolver 缺少环境变量入口；托盘常驻应用常由外部脚本拉起，只能靠环境变量。");
     }
 }

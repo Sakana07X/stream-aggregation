@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using StreamingAggregation.Core.Diagnostics;
 
 namespace StreamingAggregation.App.Composition;
 
@@ -20,6 +21,12 @@ namespace StreamingAggregation.App.Composition;
 /// </para>
 /// <para>
 /// <b>线程安全</b>：单例的创建用锁保护，解析并发调用只会拿到同一个实例。
+/// </para>
+/// <para>
+/// <b>net48 迁移</b>：参数校验从 <c>ArgumentNullException.ThrowIfNull</c>（.NET 6 才有）
+/// 改为 <see cref="Guard"/>（本仓库 Core 里已有的等价实现）；<c>Lock</c>（.NET 9）
+/// 由 Core 共享的那份 <c>Compatibility/SystemThreadingLock.cs</c> 垫片提供，
+/// 由 csproj 以链接方式编进本程序集。
 /// </para>
 /// </remarks>
 internal sealed class ServiceRegistry : IDisposable
@@ -48,7 +55,7 @@ internal sealed class ServiceRegistry : IDisposable
     public ServiceRegistry AddSingleton<TImplementation>(Func<ServiceRegistry, TImplementation> factory)
         where TImplementation : class
     {
-        ArgumentNullException.ThrowIfNull(factory);
+        Guard.NotNull(factory);
         return Register<TImplementation, TImplementation>(factory, isSingleton: true);
     }
 
@@ -63,7 +70,7 @@ internal sealed class ServiceRegistry : IDisposable
         where TService : class
         where TImplementation : class, TService
     {
-        ArgumentNullException.ThrowIfNull(factory);
+        Guard.NotNull(factory);
         return Register<TService, TImplementation>(factory, isSingleton: true);
     }
 
@@ -78,7 +85,7 @@ internal sealed class ServiceRegistry : IDisposable
         where TService : class
         where TImplementation : class, TService
     {
-        ArgumentNullException.ThrowIfNull(factory);
+        Guard.NotNull(factory);
         return Register<TService, TImplementation>(factory, isSingleton: false);
     }
 

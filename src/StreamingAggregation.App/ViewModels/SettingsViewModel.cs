@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using StreamingAggregation.Core.Abstractions;
 using StreamingAggregation.Core.Configuration;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Infrastructure.ViewModels;
 
 namespace StreamingAggregation.App.ViewModels;
@@ -256,7 +257,7 @@ public sealed class SettingsViewModel : ObservableObject
     /// <param name="settings">设置快照。</param>
     public void Apply(AppSettings settings)
     {
-        ArgumentNullException.ThrowIfNull(settings);
+        Guard.NotNull(settings);
 
         Host = settings.OneBotConnection.Host;
         Port = settings.OneBotConnection.Port;
@@ -307,8 +308,14 @@ public sealed class SettingsViewModel : ObservableObject
             return Array.Empty<string>();
         }
 
-        return text
-            .Split(['\r', '\n', ',', '，', ' ', '\t'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        return text!
+            // net48 没有 StringSplitOptions.TrimEntries（.NET 5 起）：先切再去空白，
+            // 两者顺序与 TrimEntries 的实现一致（先移除空条目，再对每项 Trim）。
+            // 行首的 ! 是因为 net48 的 string.IsNullOrWhiteSpace 没有 [NotNullWhen(false)] 标注，
+            // 编译器无法从上面的早退分支推出 text 一定非 null。
+            .Split(['\r', '\n', ',', '，', ' ', '\t'], StringSplitOptions.RemoveEmptyEntries)
+            .Select(static item => item.Trim())
+            .Where(static item => item.Length > 0)
             .Distinct(StringComparer.Ordinal)
             .ToArray();
     }
@@ -394,7 +401,9 @@ public sealed class SettingsViewModel : ObservableObject
     /// <returns>整数值。</returns>
     private static int ToInt32(double value, int fallback)
     {
-        if (!double.IsFinite(value))
+        // net48 没有 double.IsFinite（.NET Core 3.0 起），拆成 IsNaN + IsInfinity 两段判定；
+        // 语义与 IsFinite 完全一致：既不是 NaN 也不是 ±Infinity。
+        if (double.IsNaN(value) || double.IsInfinity(value))
         {
             return fallback;
         }

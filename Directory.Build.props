@@ -7,23 +7,23 @@
   <Import Project="$(MSBuildThisFileDirectory)build\Version.props" />
 
   <!--
-    阶段 1a 检查结论（WinUI3+net10 -> WPF+net48 迁移）：
+    阶段 2 后的状态（WinUI3+net10 -> WPF+net48 迁移）：
 
     1) build\Version.props 【无需改动】。它只设置 Version / AssemblyVersion /
        FileVersion / InformationalVersion 四个纯字符串属性，与 TargetFramework 无关，
        net48 与 net10.0-windows 共存时照常生效（Core / Infrastructure / Tests 的
        obj\<cfg>\net48\*.AssemblyInfo.cs 里已确认版本号正确注入）。
 
-    2) Microsoft.NETFramework.ReferenceAssemblies 与 PolySharp 【故意不抬到这里】。
-       它们目前是各项目内的 PackageReference + PrivateAssets=all，App(net10.0-windows)
-       并没有引用它们，所以不存在"net10 项目重复引用"的问题：
+    2) Microsoft.NETFramework.ReferenceAssemblies 与 PolySharp 【仍然故意不抬到这里】。
+       它们是各项目内的 PackageReference + PrivateAssets=all：
          - PolySharp 是 source generator，在 net10 上会检测到编译器已原生认识
            IsExternalInit / RequiredMemberAttribute / Index / Range 等，
            自动全部跳过生成，两个 TFM 因此能共用同一份源码；
          - RefAsm 只是 net48 编译期的参考程序集，对 net10 毫无意义。
        ⚠ 不要"顺手"把这两个包提到本文件里统一管理：一旦无条件引用，
-       App(net10.0-windows) 会被拖进 net48 的参考程序集，轻则还原变慢、
-       重则与 WindowsAppSDK 的 winmd 撞名。
+       任何 net10 项目都会被拖进 net48 的参考程序集，轻则还原变慢、
+       重则与 WindowsAppSDK 的 winmd 撞名。App 已在阶段 2 迁到 net48，
+       四个项目现在一致，但保持"每项目自持"仍然是不引入跨 TFM 耦合的更稳写法。
   -->
 
 </Project>

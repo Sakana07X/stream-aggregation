@@ -8,8 +8,8 @@ namespace StreamingAggregation.Tests.Composition;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>为什么是源码断言</b>：这三个页面是 WinUI 3 类型，测试宿主加载
-/// <c>StreamingAggregation.App</c> 需要 XAML/WinRT 运行时（同
+/// <b>为什么是源码断言</b>：这三个页面是界面层类型，测试宿主加载
+/// <c>StreamingAggregation.App</c> 需要 STA 线程与 WPF 消息泵（同
 /// <see cref="CoreInterfaceCoverageTests"/> 的说明）。于是"首屏有没有接上真实数据"
 /// 只能核对页面代码本身写了什么。
 /// </para>
@@ -21,11 +21,18 @@ namespace StreamingAggregation.Tests.Composition;
 /// <item>在 <c>await</c> 之后绕过封送通道直接给 <c>ItemsSource</c> 赋值——
 /// 编译得过、运行必崩（<c>RPC_E_WRONG_THREAD</c>），是最难在开发机上复现的一类崩法；
 /// </item>
-/// <item>忘了往组合根的 <c>CreatePage</c> 里注入存储，页面静默退化成空列表；
+/// <item>忘了往组合根的 <c>CreatePage</c> 里注入存储，页面静默退化成空列表
+/// （阶段 2 见 <see cref="CompositionRootDefersPageAssemblyUntilPagesAreMigrated"/>）；
 /// </item>
 /// <item>待办页的完成/忽略按钮又变回空实现。
 /// </item>
 /// </list>
+/// </para>
+/// <para>
+/// <b>阶段 2 状态</b>：这三个页面连同 <c>SettingsPage</c> 仍是 WinUI XAML，
+/// 已被 csproj 排除出编译，因此本类里对页面代码后置的断言暂时核对的是
+/// <b>仓库里保留的 WinUI 源码</b>，而不是运行中的行为。等阶段 3/4 把它们迁成 WPF，
+/// 这些断言会原样重新生效（页面类型名、存储接口、封送调用前缀都不需要改）。
 /// </para>
 /// </remarks>
 public sealed class DataPageStoreBindingTests
@@ -262,38 +269,67 @@ public sealed class DataPageStoreBindingTests
             "MessagesPage.xaml.cs 没有给 MessagesListView 赋值。");
     }
 
-    /// <summary>组合根必须把存储和 UI 封送委托一起注入这三个页面。</summary>
+    /// <summary>
+    /// 页面工厂在页面尚未迁移到 WPF 的阶段必须<b>响亮地失败</b>，而不是悄悄返回空页面。
+    /// </summary>
     /// <remarks>
-    /// 漏注入编译得过、页面也不报错，只会永远显示空列表——这类回归没有任何运行时信号。
-    /// </remarks>
+/// <para>
+/// <b>这条断言原本挡什么</b>：组合根漏注入存储时，页面静默退化成空列表——
+/// 编译得过、界面不报错、用户只看到"永远没有数据"。因此原断言逐页核对
+/// <c>CreatePage</c> 里的 <c>new DigestPage(_services.Resolve&lt;IDigestStore&gt;(), QueueOnUiThread)</c>。
+/// </para>
+/// <para>
+/// <b>阶段 2 迁移后的等价不变量</b>：三个页面的 XAML 仍在用 WinUI 专有控件，
+/// 已被 csproj 排除出编译，<c>CreatePage</c> 因此暂时不能构造它们。此时最危险的写法
+/// 是让 <c>CreatePage</c> 返回 <see langword="null"/> 或某个空壳——那会让阶段 3 拿着
+/// "看起来已完成"的组合根开工。所以改成断言：
+/// <list type="number">
+/// <item><description><c>CreatePage</c> 存在，并明确抛 <c>NotSupportedException</c>（不是返回 null）；</description></item>
+/// <item><description>异常消息里带阶段标记，接手的人一眼知道这是待办不是缺陷；</description></item>
+/// <item><description>页面工厂的接缝还在（<c>AppShell.PageFactory</c>），阶段 3 有地方接线；</description></item>
+/// <item><description>三个页面将来要用的存储<b>仍然注册在组合根里</b>——
+/// 这是原断言真正想守住的东西，页面没回来不代表它们可以被顺手删掉。</description></item>
+/// </list>
+/// 阶段 3/4 把页面迁回 WPF 后，请把本页恢复成逐页核对 <c>CreatePage</c> 构造分支的断言。
+/// </para>
+/// </remarks>
     [Fact]
-    public void CompositionRootInjectsStoresAndTheUiMarshalDelegate()
+    public void CompositionRootDefersPageAssemblyUntilPagesAreMigrated()
     {
         var source = RepositorySourceFile.Read(CompositionRootPath);
         var createPage = RepositorySourceFile.ExtractMethodBody(source, CreatePageSignature);
 
         Assert.False(
             string.IsNullOrEmpty(createPage),
-            "AppCompositionRoot.cs 中找不到 CreatePage 方法体，无法核对页面装配。");
+            "AppCompositionRoot.cs 中找不到 CreatePage 方法体，页面工厂在阶段 3 之后无处接线。");
 
-        foreach (var (pageName, storeInterface) in new[]
-                 {
-                     ("DigestPage", "IDigestStore"),
-                     ("TodoPage", "ITaskStore"),
-                     ("MessagesPage", "IMessageStore"),
-                 })
+        Assert.True(
+            Regex.IsMatch(createPage!, @"throw\s+new\s+NotSupportedException\s*\(", RegexOptions.CultureInvariant),
+            "页面尚未迁移到 WPF 时，CreatePage 必须抛 NotSupportedException；" +
+            "返回 null 或空壳会让阶段 3 拿到一个「看起来已完成」的组合根。");
+
+        Assert.True(
+            Regex.IsMatch(createPage!, @"阶段\s*3\s*/\s*4", RegexOptions.CultureInvariant),
+            "CreatePage 的异常消息必须带上阶段标记，接手的人才会知道这是待办而不是缺陷。");
+
+        // 页面工厂的接缝必须还在。
+        var shell = RepositorySourceFile.Read("src/StreamingAggregation.App/Composition/AppShell.cs");
+        Assert.True(
+            Regex.IsMatch(shell, @"Func<Type,\s*Page>\s+PageFactory", RegexOptions.CultureInvariant),
+            "AppShell.PageFactory 的签名不再是 Func<Type, Page>，阶段 3 接不上页面工厂。");
+
+        // 三个页面将来要用的存储仍必须注册在组合根里（这是原断言真正守的东西）。
+        // 注册写法是 AddSingleton<TService, TImplementation>（两个泛型实参），
+        // 因此匹配 `<TStore,` 或 `<TStore>` 两种形式。
+        foreach (var storeInterface in new[] { "IDigestStore", "ITaskStore", "IMessageStore" })
         {
             Assert.True(
                 Regex.IsMatch(
-                    createPage!,
-                    $@"new\s+{pageName}\s*\(\s*_services\.Resolve<{storeInterface}>\s*\(\s*\)\s*,\s*QueueOnUiThread\s*\)",
-                    RegexOptions.Singleline | RegexOptions.CultureInvariant),
-                $"CreatePage 没有把 {storeInterface} 与 UI 线程封送委托注入 {pageName}。");
+                    source,
+                    $@"AddSingleton<{storeInterface}\s*[,>]",
+                    RegexOptions.CultureInvariant),
+                $"组合根不再注册 {storeInterface}：页面迁回后没有存储可注入，只能显示空列表。");
         }
-
-        Assert.False(
-            Regex.IsMatch(createPage!, @"new\s+(DigestPage|TodoPage|MessagesPage)\s*\(\s*\)", RegexOptions.CultureInvariant),
-            "CreatePage 里还有无参构造的数据页，页面拿不到存储与封送委托。");
     }
 
     /// <summary>页面加载上下文必须真的走注入的封送委托，并把失败记进日志。</summary>

@@ -1,7 +1,4 @@
 using System.Diagnostics;
-using System.Security.Principal;
-using Microsoft.Windows.AppNotifications;
-using Microsoft.Windows.AppNotifications.Builder;
 using StreamingAggregation.Core.Abstractions;
 
 namespace StreamingAggregation.App.Services;
@@ -56,67 +53,78 @@ public enum NotificationLogLevel
 public delegate void NotificationLogSink(NotificationLogLevel level, string message, Exception? exception);
 
 /// <summary>
-/// 基于 Windows App SDK <c>AppNotificationManager</c> 的 <see cref="INotificationService"/> 实现。
+/// 通知通道的占位实现：<b>阶段 2 不发任何通知，只把降级原因记进日志</b>。
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>能力探测 + 优雅降级</b>：首次发通知前依次探测"系统是否支持 → 进程是否提权 → 能否注册
-/// → 系统是否允许本应用发通知"。任何一环不通过都只记日志，并把 <see cref="Capability"/> 置为对应状态；
-/// 之后 <see cref="NotifyUrgent"/>/<see cref="NotifyDeadline"/> 变成空操作。通知是锦上添花，
-/// 不能因为它把聚合主流程带崩。
+/// <b>为什么现在是个桩。</b>WinUI 3 版本的实现依赖 Windows App SDK 的
+/// <c>AppNotificationManager</c>，那是 <c>net10.0-windows10.0.19041.0</c> 上的 WinRT API，
+/// 在 net48 上不存在（net48 没有 WinAppSDK），照抄必然编译不过。
+/// 阶段 5 的正确做法是用 <c>CommunityToolkit.WinUI.Notifications</c> 的
+/// <c>ToastNotificationManagerCompat</c>（+ <c>Microsoft.Windows.SDK.Contracts</c> 的 winmd 引用），
+/// 这两个包本阶段已经挂进 csproj，阶段 5 只需换掉本类内部实现。
 /// </para>
 /// <para>
-/// <b>unpackaged 与 AUMID</b>：本应用以 unpackaged 方式运行，没有包标识，而通知平台要求每条通知
-/// 有归属的 AUMID，否则通知无处落地。<c>AppNotificationManager.Register()</c> 会为 unpackaged 应用
-/// 完成这层 AUMID/COM 注册（AUMID 取 <see cref="NotificationTemplates.AppUserModelId"/>），
-/// 注册失败即视为通道不可用。已知部分 self-contained 发布形态下 unpackaged 原生通知会失效，
-/// 这正是必须"探测后降级"、而不是假定可用的原因。
+/// <b>探针结论（.tmp/net48-probe/REPORT.md 第 5 项，实测）</b>：
+/// <list type="bullet">
+/// <item><description><c>ToastNotificationManagerCompat.CreateToastNotifier()</c> 可用，
+/// <c>Setting == Enabled</c>，<c>Show()</c> 成功，且首次调用会自动写
+/// <c>HKCU\SOFTWARE\Classes\AppUserModelId\</c>（按 exe 路径），因此不需要管理员权限、
+/// 不需要 Start 菜单快捷方式——零安装目标成立。</description></item>
+/// <item><description><b>不要</b>直接调 <c>Windows.UI.Notifications.ToastNotificationManager</c>：
+/// unpackaged 进程没有 AUMID，实测抛 <c>HRESULT 0x80070490</c>。
+/// 定时 toast（<c>AddToSchedule</c>）在 net48 unpackaged 下同样不可用。</description></item>
+/// </list>
 /// </para>
 /// <para>
-/// <b>线程模型</b>：通知由 OneBot WebSocket 的后台线程触发。<c>Show</c> 本身线程安全、
-/// 不需要 UI 线程，因此本类刻意不做 <c>DispatcherQueue</c> 封送，避免引入跨线程依赖。
+/// <b>降级语义保持不变</b>：本类仍然实现 <see cref="INotificationService"/>，仍然不向调用方抛异常，
+/// <see cref="Probe"/> 仍然给出明确结论（这里是 <see cref="NotificationCapability.RegistrationFailed"/>），
+/// 因此管线侧的调用逻辑一行都不用改，阶段 5 换实现即插即用。
+/// 通知是锦上添花，不能因为它把聚合主流程带崩。
+/// </para>
+/// <para>
+/// TODO(阶段 5): 用 <c>ToastNotificationManagerCompat</c> 重写 <c>Send</c>，
+/// 把 <see cref="NotificationTemplates"/> 的 payload 交给 <c>ToastNotification</c>；
+/// 恢复 <c>AppNotificationBuilder.IsUrgentScenarioSupported()</c> 的 urgent 场景探测。
 /// </para>
 /// </remarks>
 public sealed class ToastNotificationService : INotificationService, IDisposable
 {
+    /// <summary>阶段 2 的固定降级结论：注册从未发生，通道不可用。</summary>
+    private const NotificationCapability Stage2Capability = NotificationCapability.RegistrationFailed;
+
+    /// <summary>阶段 2 的降级说明。日志与 UI 上都应能一眼看出"通知没接"是已知状态而非异常。</summary>
+    private const string Stage2Reason =
+        "通知通道尚未迁移到 WPF/net48（阶段 5 处理），本阶段所有通知都会被跳过。";
+
     private readonly NotificationLogSink _log;
-    private readonly Func<bool> _isElevated;
     private readonly object _gate = new();
-
-    private int _capability = (int)NotificationCapability.Unknown;
-    private bool _registered;
+    private bool _probed;
     private bool _disposed;
-
-    /// <summary>系统是否支持 <c>scenario="urgent"</c>；探测一次后固定，探测失败按不支持处理。</summary>
-    private volatile bool _urgentScenario;
 
     /// <summary>
     /// 创建通知服务。
     /// </summary>
     /// <param name="log">日志写入回调；为 <see langword="null"/> 时使用 <see cref="Trace"/> 输出。</param>
-    /// <param name="isElevated">
-    /// 进程是否提权的判定委托；为 <see langword="null"/> 时按当前线程令牌实时判断。抽成委托便于测试。
-    /// </param>
-    public ToastNotificationService(NotificationLogSink? log = null, Func<bool>? isElevated = null)
+    public ToastNotificationService(NotificationLogSink? log = null) => _log = log ?? DefaultLog;
+
+    /// <summary>最近一次探测得到的通知通道能力。</summary>
+    public NotificationCapability Capability
     {
-        _log = log ?? DefaultLog;
-        _isElevated = isElevated ?? DetectElevation;
+        get
+        {
+            lock (_gate)
+            {
+                return _probed ? Stage2Capability : NotificationCapability.Unknown;
+            }
+        }
     }
 
-    /// <summary>最近一次探测得到的通知通道能力；<see cref="NotificationCapability.Unknown"/> 表示尚未探测。</summary>
-    public NotificationCapability Capability => (NotificationCapability)Volatile.Read(ref _capability);
+    /// <inheritdoc />
+    public void NotifyUrgent(string title, string message) => Skip("urgent", title, message);
 
     /// <inheritdoc />
-    public void NotifyUrgent(string title, string message) =>
-        Send(
-            "urgent",
-            title,
-            message,
-            NotificationTemplates.CreateUrgent(title, message, sourceId: null, urgentScenario: _urgentScenario));
-
-    /// <inheritdoc />
-    public void NotifyDeadline(string title, string message) =>
-        Send("deadline", title, message, NotificationTemplates.CreateDeadline(title, message));
+    public void NotifyDeadline(string title, string message) => Skip("deadline", title, message);
 
     /// <summary>
     /// 主动触发一次能力探测，不必等到真的发通知。
@@ -125,97 +133,9 @@ public sealed class ToastNotificationService : INotificationService, IDisposable
     /// 供启动阶段做通道自检：提前把不可用原因落到日志里，
     /// 免得用户第一次收到紧急事项时才发现通知根本没开。
     /// </remarks>
-    /// <returns>探测结论。</returns>
-    public NotificationCapability Probe() => EnsureReady();
-
-    /// <inheritdoc />
-    public void Dispose()
+    /// <returns>探测结论。阶段 2 恒为 <see cref="NotificationCapability.RegistrationFailed"/>。</returns>
+    public NotificationCapability Probe()
     {
-        bool shouldUnregister;
-
-        lock (_gate)
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            _disposed = true;
-            shouldUnregister = _registered && Capability == NotificationCapability.Ready;
-            _registered = false;
-        }
-
-        // 探测阶段就判定不可用时无需反注册。
-        if (!shouldUnregister)
-        {
-            return;
-        }
-
-        try
-        {
-            AppNotificationManager.Default.Unregister();
-        }
-        catch (Exception ex)
-        {
-            _log(NotificationLogLevel.Warning, "反注册通知通道失败（已忽略）。", ex);
-        }
-    }
-
-    /// <summary>发送一条通知；任何失败都只记日志，绝不向调用方抛出。</summary>
-    private void Send(string kind, string title, string message, NotificationPayload payload)
-    {
-        if (EnsureReady() != NotificationCapability.Ready)
-        {
-            // 通道不可用时静默跳过：这是设计上的降级路径，不是错误。
-            return;
-        }
-
-        try
-        {
-            var notification = new AppNotification(payload.Xml)
-            {
-                // 同组折叠：紧急事项可能短时间连发多条，不分组会把操作中心刷满。
-                Group = payload.Group,
-                Priority = MapPriority(payload.Priority),
-            };
-
-            if (payload.Tag is { } tag)
-            {
-                notification.Tag = tag;
-            }
-
-            AppNotificationManager.Default.Show(notification);
-            _log(NotificationLogLevel.Debug, $"已发送 {kind} 通知：{Summarize(title, message)}", null);
-        }
-        catch (Exception ex)
-        {
-            // 部分场景（如 self-contained unpackaged 发布）下 Show 会抛 WinRT 异常。
-            // 单条通知失败不应拖垮后续通知，这里只记日志并保持通道可用。
-            _log(NotificationLogLevel.Error, $"发送 {kind} 通知失败：{Summarize(title, message)}", ex);
-        }
-    }
-
-    private static AppNotificationPriority MapPriority(NotificationPriority priority) => priority switch
-    {
-        NotificationPriority.High => AppNotificationPriority.High,
-        _ => AppNotificationPriority.Default,
-    };
-
-    /// <summary>
-    /// 幂等地完成能力探测与平台注册。
-    /// </summary>
-    /// <remarks>
-    /// 结论缓存在 <see cref="_capability"/>：失败结论不会在每次调用时重复探测（否则会持续刷日志），
-    /// 成功结论则跳过重复 <c>Register()</c>。
-    /// </remarks>
-    private NotificationCapability EnsureReady()
-    {
-        var current = Capability;
-        if (current != NotificationCapability.Unknown)
-        {
-            return current;
-        }
-
         lock (_gate)
         {
             if (_disposed)
@@ -223,171 +143,43 @@ public sealed class ToastNotificationService : INotificationService, IDisposable
                 return NotificationCapability.RegistrationFailed;
             }
 
-            var cached = (NotificationCapability)Volatile.Read(ref _capability);
-            if (cached != NotificationCapability.Unknown)
+            if (_probed)
             {
-                return cached;
+                return Stage2Capability;
             }
 
-            var detected = Detect();
-            Volatile.Write(ref _capability, (int)detected);
-            return detected;
+            _probed = true;
         }
+
+        _log(NotificationLogLevel.Warning, Stage2Reason, null);
+        return Stage2Capability;
     }
 
-    /// <summary>按顺序执行各项探测，全部通过才返回 <see cref="NotificationCapability.Ready"/>。</summary>
-    private NotificationCapability Detect()
+    /// <inheritdoc />
+    public void Dispose()
     {
-        if (!IsPlatformSupported())
+        lock (_gate)
         {
-            return Degrade(
-                NotificationCapability.UnsupportedPlatform,
-                "当前系统不支持应用通知，所有通知将被跳过。");
+            _disposed = true;
         }
 
-        if (_isElevated())
-        {
-            return Degrade(
-                NotificationCapability.Elevated,
-                "进程处于管理员提权状态，Windows 通知平台会静默丢弃所有通知；请以普通用户运行。");
-        }
-
-        return TryRegister();
+        // 阶段 2 从未注册通知通道，因此没有反注册动作；阶段 5 在此补 Unregister 等价清理。
     }
 
-    private bool IsPlatformSupported()
-    {
-        try
-        {
-            return AppNotificationManager.IsSupported();
-        }
-        catch (Exception ex)
-        {
-            _log(NotificationLogLevel.Warning, "查询应用通知支持状态失败，按不支持处理。", ex);
-            return false;
-        }
-    }
-
-    /// <summary>向通知平台注册自身；unpackaged 应用由此建立 AUMID 归属。</summary>
-    private NotificationCapability TryRegister()
-    {
-        _urgentScenario = ProbeUrgentScenario();
-
-        try
-        {
-            AppNotificationManager.Default.Register();
-            _registered = true;
-        }
-        catch (Exception ex)
-        {
-            return Degrade(
-                NotificationCapability.RegistrationFailed,
-                $"注册通知通道失败（AUMID={NotificationTemplates.AppUserModelId}），所有通知将被跳过。",
-                ex);
-        }
-
-        return ResolveSetting();
-    }
-
-    /// <summary>
-    /// 探测系统是否支持 <c>scenario="urgent"</c>。
-    /// </summary>
+    /// <summary>跳过一条通知：只记日志，绝不向调用方抛出。</summary>
     /// <remarks>
-    /// 该场景只有部分 Windows 11 构建支持；写进不受支持的 XML 会导致整条通知被丢弃，
-    /// 因此必须先探测。探测本身失败时按"不支持"处理，退回默认场景。
+    /// 降级原因由 <see cref="Probe"/> 在启动时记一条就够了，但「我明明触发了却什么都没弹」
+    /// 是最容易被当成 bug 报上来的问题，所以每次跳过都留一条 Debug 级记录——
+    /// 日志默认没有监听器（项目尚未引入日志框架），这行的成本目前是零。
     /// </remarks>
-    private bool ProbeUrgentScenario()
+    /// <param name="kind">通知类别，仅用于日志前缀。</param>
+    /// <param name="title">标题。</param>
+    /// <param name="message">正文。</param>
+    private void Skip(string kind, string? title, string? message)
     {
-        try
-        {
-            return AppNotificationBuilder.IsUrgentScenarioSupported();
-        }
-        catch (Exception ex)
-        {
-            _log(NotificationLogLevel.Debug, "探测 urgent 通知场景失败，按不支持处理。", ex);
-            return false;
-        }
-    }
-
-    /// <summary>读取通知平台设置并翻译成能力状态。</summary>
-    private NotificationCapability ResolveSetting()
-    {
-        AppNotificationSetting setting;
-
-        try
-        {
-            setting = AppNotificationManager.Default.Setting;
-        }
-        catch (Exception ex)
-        {
-            // 读不到设置不代表一定被禁用，按允许处理，交给 Show 自行判定。
-            _log(NotificationLogLevel.Warning, "读取通知设置失败，按允许处理。", ex);
-            return NotificationCapability.Ready;
-        }
-
-        if (setting == AppNotificationSetting.Enabled)
-        {
-            _log(
-                NotificationLogLevel.Info,
-                $"通知通道就绪（AUMID={NotificationTemplates.AppUserModelId}）。",
-                null);
-            return NotificationCapability.Ready;
-        }
-
-        return Degrade(MapSetting(setting), DescribeSetting(setting));
-    }
-
-    private static NotificationCapability MapSetting(AppNotificationSetting setting) => setting switch
-    {
-        AppNotificationSetting.DisabledForUser => NotificationCapability.DisabledByUser,
-        AppNotificationSetting.DisabledForApplication => NotificationCapability.DisabledForApplication,
-        AppNotificationSetting.DisabledByGroupPolicy => NotificationCapability.DisabledByPolicy,
-        AppNotificationSetting.DisabledByManifest => NotificationCapability.DisabledByManifest,
-        _ => NotificationCapability.UnsupportedPlatform,
-    };
-
-    private static string DescribeSetting(AppNotificationSetting setting) => setting switch
-    {
-        AppNotificationSetting.DisabledForUser => "用户在系统通知设置里关闭了本应用的通知，所有通知将被跳过。",
-        AppNotificationSetting.DisabledForApplication => "本应用的通知已被单独禁用，所有通知将被跳过。",
-        AppNotificationSetting.DisabledByGroupPolicy => "通知被组策略禁用，所有通知将被跳过。",
-        AppNotificationSetting.DisabledByManifest => "通知被应用清单声明禁用，所有通知将被跳过。",
-        AppNotificationSetting.Unsupported => "当前系统不支持应用通知，所有通知将被跳过。",
-        _ => $"通知不可用（Setting={setting}），所有通知将被跳过。",
-    };
-
-    /// <summary>记录降级原因并返回降级状态。</summary>
-    private NotificationCapability Degrade(NotificationCapability capability, string message, Exception? ex = null)
-    {
-        _log(
-            ex is null ? NotificationLogLevel.Warning : NotificationLogLevel.Error,
-            message,
-            ex);
-        return capability;
-    }
-
-    /// <summary>判断当前进程是否处于提权（管理员）状态。</summary>
-    private static bool DetectElevation()
-    {
-        try
-        {
-            using var identity = WindowsIdentity.GetCurrent();
-            return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
-        }
-        catch (Exception)
-        {
-            // 取不到身份信息时按"未提权"处理：不因为探测自身失败就禁用通知。
-            return false;
-        }
-    }
-
-    private static void DefaultLog(NotificationLogLevel level, string message, Exception? exception)
-    {
-        var line = exception is null
-            ? $"[Notification:{level}] {message}"
-            : $"[Notification:{level}] {message} -> {exception.GetType().Name}: {exception.Message}";
-
-        Trace.WriteLine(line);
+        // 只在首次探测时已经记过原因就不再刷屏；但首次发送仍然要留一条，
+        // 因为「我发了通知但什么都没弹」是最容易被当成 bug 报上来的问题。
+        _log(NotificationLogLevel.Debug, $"已跳过 {kind} 通知：{Summarize(title, message)}", null);
     }
 
     /// <summary>
@@ -397,11 +189,27 @@ public sealed class ToastNotificationService : INotificationService, IDisposable
     /// 两个分支都走 <see cref="NotificationTemplates.NormalizeTitle"/>，因为它按 Unicode 标量截断，
     /// 不会把代理对从中间劈开；这里直接复用其结果，不再二次按码元截断。
     /// </remarks>
+    /// <param name="title">标题。</param>
+    /// <param name="message">正文。</param>
+    /// <returns>摘要文本。</returns>
     private static string Summarize(string? title, string? message)
     {
         var text = NotificationTemplates.NormalizeTitle(title);
         return string.IsNullOrEmpty(text)
             ? NotificationTemplates.NormalizeTitle(message)
             : text;
+    }
+
+    /// <summary>默认日志出口：写 <see cref="Trace"/>。</summary>
+    /// <param name="level">级别。</param>
+    /// <param name="message">消息。</param>
+    /// <param name="exception">异常。</param>
+    private static void DefaultLog(NotificationLogLevel level, string message, Exception? exception)
+    {
+        var line = exception is null
+            ? $"[Notification:{level}] {message}"
+            : $"[Notification:{level}] {message} -> {exception.GetType().Name}: {exception.Message}";
+
+        Trace.WriteLine(line);
     }
 }

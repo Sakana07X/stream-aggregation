@@ -1,5 +1,5 @@
 using System;
-using Microsoft.UI.Xaml.Controls;
+using System.Windows.Controls;
 using StreamingAggregation.App.ViewModels;
 using StreamingAggregation.Infrastructure.ViewModels;
 
@@ -16,6 +16,11 @@ namespace StreamingAggregation.App.Composition;
 /// </para>
 /// <para>
 /// 本类型只承载依赖，不含行为；真正的组装在 <see cref="AppCompositionRoot"/>。
+/// </para>
+/// <para>
+/// <b>WinUI 3 → WPF</b>：<c>Page</c> 与 <c>Frame</c> 两个类型的全名在两套框架里一致
+/// （<c>System.Windows.Controls.Page</c> / <c>.Frame</c>），因此本页工厂的签名
+/// <c>Func&lt;Type, Page&gt;</c> 原样保留，调用方无需改动。
 /// </para>
 /// </remarks>
 public sealed class AppShell

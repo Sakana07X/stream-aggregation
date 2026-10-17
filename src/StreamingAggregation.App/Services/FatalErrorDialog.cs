@@ -6,14 +6,14 @@ using System.Text.RegularExpressions;
 namespace StreamingAggregation.App.Services;
 
 /// <summary>
-/// 启动早期致命错误的兜底对话框：直接调 Win32 <c>MessageBoxW</c>，不经过 XAML。
+/// 启动早期致命错误的兜底对话框：直接调 Win32 <c>MessageBoxW</c>，不经过 WPF 界面对象。
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>为什么不能只用 ContentDialog</b>：走到这条路径的原因正是"主窗口还没建起来"，
-/// 而 <c>ContentDialog</c> 必须挂在某个 <c>XamlRoot</c> 上才能显示——恰恰是此刻没有的东西。
-/// 用 XAML 去报"XAML 还不可用"的错，本身就是死结。
-/// <c>MessageBoxW</c> 只依赖线程消息泵，不依赖 XAML/WinRT 对象图，因此在任何阶段都还活着。
+/// <b>为什么不用 WPF 的窗口内对话框</b>：走到这条路径的原因正是"主窗口还没建起来"，
+/// 而任何 WPF 对话框都必须先有一个能承载它的窗口、还要在 UI 线程上等消息泵空下来——
+/// 恰恰是此刻没有的东西。用界面框架去报"界面还不可用"的错，本身就是死结。
+/// <c>MessageBoxW</c> 只依赖线程消息泵，不依赖任何 WPF 对象图，因此在任何阶段都还活着。
 /// </para>
 /// <para>
 /// <b>脱敏取舍</b>：对话框文本会被用户截图、进 Issue、进工单，因此显示前统一清洗——
@@ -22,14 +22,14 @@ namespace StreamingAggregation.App.Services;
 /// 正是用户唯一需要的信息，脱敏掉它等于让这个兜底框变得没用。
 /// </para>
 /// <para>
-/// <b>永不抛出</b>：非 Windows 平台、user32 缺失、入口点不存在——一切失败都退化成
+/// <b>永不抛出</b>：user32 缺失、入口点不存在——一切失败都退化成
 /// <see cref="Trace"/>。调用方的"要不要退出进程"决策不能因为"错误框自己出错"而丢失，
 /// 那会把一次可见的失败重新变成静默失败。
 /// </para>
 /// </remarks>
 internal static class FatalErrorDialog
 {
-    /// <summary>兜底对话框标题；与窗口内 <c>ContentDialog</c> 共用同一份文案。</summary>
+    /// <summary>兜底对话框标题；窗口尚未建立，没有"窗口内对话框"可共用同一份文案。</summary>
     public const string DefaultTitle = "流式聚合启动失败";
 
     /// <summary>脱敏后仍为空时使用的占位文案。</summary>
@@ -113,7 +113,10 @@ internal static class FatalErrorDialog
         // 调试输出会进日志文件，因此同样先脱敏——本地日志不该成为密钥的二次泄漏面。
         Trace.WriteLine($"[FatalError] {caption}: {text}");
 
-        if (!OperatingSystem.IsWindows())
+        // net48 没有 OperatingSystem.IsWindows（.NET 5 起）；RuntimeInformation 在
+        // .NET Framework 4.7.1 起就是 mscorlib 里的内建类型，直接用即可。
+        // 判据保持"进程能否加载 user32"这一层含义，而不是简单的 OS 版本号。
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             Trace.WriteLine("[FatalError] 非 Windows 平台，没有 Win32 兜底对话框可用。");
             return;
@@ -213,7 +216,9 @@ internal static class FatalErrorDialog
             cut--;
         }
 
-        return string.Concat(text.AsSpan(0, cut), TruncationMarker);
+        // string.Concat(ReadOnlySpan<char>, ReadOnlySpan<char>) 是 .NET Core 的重载，net48 上没有；
+        // 必须走 Substring，编译期就会把这件事暴露出来，而不是运行时才 MissingMethod。
+        return text.Substring(0, cut) + TruncationMarker;
     }
 
     /// <summary>

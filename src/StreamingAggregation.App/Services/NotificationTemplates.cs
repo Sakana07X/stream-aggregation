@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Text;
 using System.Xml.Linq;
 
@@ -40,6 +41,12 @@ public sealed record NotificationPayload(
 /// 其中的 <c>&lt;</c>、<c>&amp;</c> 会被自动转义；手写插值会产出非法 XML，
 /// 整条通知将被系统静默丢弃。
 /// </para>
+/// <para>
+/// 【阶段 2】本类的 XML 生成与截断逻辑已改成 net48 可编译（不再依赖
+/// <c>string.EnumerateRunes</c> 与 <c>System.Text.Rune</c>），但它<b>尚未被真正使用</b>：
+/// <c>ToastNotificationService</c> 已被降级为不发通知的桩（见该文件）。
+/// 阶段 5 接上 <c>ToastNotificationManagerCompat</c> 时，本类的 payload 才重新上生产线。
+/// </para>
 /// </remarks>
 public static class NotificationTemplates
 {
@@ -48,9 +55,14 @@ public static class NotificationTemplates
     /// </summary>
     /// <remarks>
     /// unpackaged 应用没有包标识，而 Windows 通知平台要求每条通知有归属的 AUMID，
-    /// 否则通知无处落地。本值由 <see cref="ToastNotificationService"/> 在
-    /// <c>AppNotificationManager.Register()</c> 时注册到通知平台，
-    /// 并作为后续统计、去重与开始菜单匹配的稳定键。
+    /// 否则通知无处落地。本值作为后续统计、去重与开始菜单匹配的稳定键。
+    /// <para>
+    /// 【阶段 2】注册动作暂时没有执行者：<c>AppNotificationManager.Register()</c> 属于
+    /// Windows App SDK，net48 上不存在。阶段 5 改用
+    /// <c>ToastNotificationManagerCompat</c> 时，它会按 exe 路径自动写
+    /// <c>HKCU\SOFTWARE\Classes\AppUserModelId\</c>（探针实测，无需管理员权限与
+    /// 开始菜单快捷方式），届时本常量用于日志与去重键，而不是注册调用本身。
+    /// </para>
     /// </remarks>
     public const string AppUserModelId = "StreamingAggregation.App.Notifications";
 
@@ -178,8 +190,10 @@ public static class NotificationTemplates
         return $"{launch}&{SourceIdArgumentKey}={Uri.EscapeDataString(Sanitize(sourceId))}";
     }
 
+    // 【net48】string.IsNullOrWhiteSpace 在 .NET Framework 上没有 [NotNullWhen(false)] 标注
+    // （.NET Core 3.0 起才有），因此后面的解引用必须自己写 !，否则 CS8602 逐处报警。
     private static string? BuildTag(string prefix, string? sourceId) =>
-        string.IsNullOrWhiteSpace(sourceId) ? null : prefix + sourceId.Trim();
+        string.IsNullOrWhiteSpace(sourceId) ? null : prefix + sourceId!.Trim();
 
     private static string BuildToast(
         string? title,
@@ -218,22 +232,76 @@ public static class NotificationTemplates
             return string.Empty;
         }
 
-        var builder = new StringBuilder(text.Length);
-        foreach (var rune in text.EnumerateRunes())
+        var builder = new StringBuilder(text!.Length);
+
+        // 【net48】string.EnumerateRunes / System.Text.Rune 都是 .NET Core 2.1+ 的 API，
+        // net48 上不存在，且 PolySharp 补不了（源生成器只能造类型，不能给既有类型加方法）。
+        // 这里改为自行按 UTF-16 代理对解码出 Unicode 标量值，语义与 EnumerateRunes 相同：
+        // 合法代理对合成一个大于 U+FFFF 的标量，孤立代理项原样作为标量返回（随后会被
+        // IsXmlChar 过滤掉，因为代理区码位不属于 XML 1.0 允许的字符集）。
+        foreach (var scalar in EnumerateScalars(text))
         {
-            if (rune.Value is '\t' or '\n' or '\r')
+            if (scalar is '\t' or '\n' or '\r')
             {
                 builder.Append(' ');
                 continue;
             }
 
-            if (IsXmlChar(rune.Value))
+            if (IsXmlChar(scalar))
             {
-                builder.Append(rune.ToString());
+                AppendScalar(builder, scalar);
             }
         }
 
         return CollapseWhitespace(builder.ToString());
+    }
+
+    /// <summary>
+    /// 按 Unicode 标量（而非 UTF-16 码元）遍历字符串。
+    /// </summary>
+    /// <remarks>
+    /// 逐项返回 <see cref="int"/> 标量值而不是字符串：<c>System.Text.Rune</c> 这个类型在 net48 上不存在，
+    /// 用 <see cref="int"/> 承载标量值是唯一不需要新包的做法。
+    /// </remarks>
+    /// <param name="text">待遍历的文本。</param>
+    /// <returns>标量值序列。</returns>
+    private static IEnumerable<int> EnumerateScalars(string text)
+    {
+        for (var index = 0; index < text.Length; index++)
+        {
+            char current = text[index];
+
+            // 高代理字符只有在紧跟低代理字符时才组成一个标量；其余情况一律当作独立码元。
+            if (char.IsHighSurrogate(current)
+                && index + 1 < text.Length
+                && char.IsLowSurrogate(text[index + 1]))
+            {
+                yield return char.ConvertToUtf32(current, text[index + 1]);
+                index++;
+                continue;
+            }
+
+            yield return current;
+        }
+    }
+
+    /// <summary>
+    /// 把一个 Unicode 标量按 UTF-16 追加到 <see cref="StringBuilder"/>。
+    /// </summary>
+    /// <remarks>
+    /// 代理区码位（U+D800–U+DFFF）不是合法标量，<see cref="char.ConvertFromUtf32"/> 会对它们抛异常；
+    /// 调用方必须先经 <see cref="IsXmlChar"/> 过滤，这里再补一道防御，避免误用直接崩掉通知生成。
+    /// </remarks>
+    /// <param name="builder">目标。</param>
+    /// <param name="scalar">Unicode 标量值。</param>
+    private static void AppendScalar(StringBuilder builder, int scalar)
+    {
+        if (scalar is >= 0xD800 and <= 0xDFFF)
+        {
+            return;
+        }
+
+        builder.Append(char.ConvertFromUtf32(scalar));
     }
 
     /// <summary>判断 Unicode 标量值是否属于 XML 1.0 允许的字符集。</summary>
@@ -288,12 +356,19 @@ public static class NotificationTemplates
         // 两个上限都远大于 1，这里的防御分支只为避免极端配置下的 Take(-1)。
         var keep = Math.Max(0, maxLength - 1);
 
-        // 必须逐个 Rune 转成字符串再拼接：Rune 不是 char，
-        // 直接对 IEnumerable<Rune> 调 ToString() 拿到的是集合的类型名而不是内容。
+        // 必须按 Unicode 标量逐个转成 UTF-16 再拼接：按码元截断会把代理对从中间劈开产生乱码。
         var builder = new StringBuilder(keep + 1);
-        foreach (var rune in text.EnumerateRunes().Take(keep))
+        var taken = 0;
+
+        foreach (var scalar in EnumerateScalars(text))
         {
-            builder.Append(rune.ToString());
+            if (taken == keep)
+            {
+                break;
+            }
+
+            AppendScalar(builder, scalar);
+            taken++;
         }
 
         builder.Append('…');

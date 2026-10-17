@@ -1,56 +1,68 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    WinUI 3 unpackaged 应用骨架。
-    说明：本机没有 `dotnet new winui` 模板，故手写本文件；配置取自已实测通过的探针工程。
-    注意：入口点由 XAML 标记编译器自动生成（App.xaml 被登记为 ApplicationDefinition，
-    生成 obj/...\App.g.i.cs 内的 Program.Main）。本项目禁止添加 Program.cs 或 Main 方法，
-    否则会触发 CS0017 入口点冲突。
+    WPF + .NET Framework 4.8 应用骨架（阶段 2：能编译、能启动、空窗口 + 最小托盘）。
+
+    迁移自 WinUI 3 + net10.0-windows10.0.19041.0。选择 WPF/net48 的终极目标是「零安装」：
+    net48 自带在 Windows 10 1903+ 与 Windows 11 上，输出目录里不会出现
+    coreclr.dll / hostfxr.dll / System.Private.CoreLib.dll，解压双击即可运行。
+
+    ⚠ 入口点仍然由 XAML 标记编译器自动生成：App.xaml 被登记为 ApplicationDefinition，
+    生成 obj\<cfg>\net48\App.g.i.cs 里的 Program.Main。本项目【禁止】添加 Program.cs
+    或任何 Main 方法，否则触发 CS0017 入口点冲突。
+    （与 WinUI 时期相比只是生成路径与命名空间变了，规则本身没有放宽。）
   -->
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
-    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <TargetFramework>net48</TargetFramework>
+    <!-- net48 的默认 LangVersion 是 7.3，本项目用到 record / 集合表达式，必须抬到 latest。 -->
+    <LangVersion>latest</LangVersion>
+    <UseWPF>true</UseWPF>
     <RootNamespace>StreamingAggregation.App</RootNamespace>
     <AssemblyName>StreamingAggregation.App</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Platforms>x64</Platforms>
-    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <!-- 托盘与窗口图标（Assets\AppIcon.ico） -->
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-  </PropertyGroup>
-
-  <!-- WinUI / unpackaged 必需配置 -->
-  <PropertyGroup>
-    <UseWinUI>true</UseWinUI>
-    <EnableMsixTooling>true</EnableMsixTooling>
-    <!-- 让 WindowsAppSDK 的 Microsoft.WinUI.props 自动把 Assets\**\*.* 收进 Content -->
-    <EnableDefaultAssets>true</EnableDefaultAssets>
-    <WindowsPackageType>None</WindowsPackageType>
     <!--
-      部署形态：.NET 框架依赖 + Windows App SDK 自包含。
+      PlatformTarget=x64 与 RuntimeIdentifier=win-x64 【两个都必须写】，缺一不可。
 
-      这两个属性写的是"默认值"，不是"强制值"。MSBuild 里命令行 -p: 传进来的
-      是全局属性，全局属性会让 $(SelfContained) 非空，于是下面的 Condition 不成立、
-      赋值被跳过。若不加 Condition，属性就变成硬编码，build/publish.ps1 的
-      -p:SelfContained=false 会被无声覆盖，发布形态与脚本声明的不符。
-      （这是真实踩过的坑：改成可覆盖形式后，脚本才真正握有发布形态的控制权。）
-
-      WindowsAppSDKSelfContained 保持 true 的原因：用户只需装一个运行时
-      （.NET Desktop Runtime），而 WinAppSDK 运行时缺失的表现是 bootstrap 静默
-      失败、没有清晰报错，比缺 .NET 难排查得多。
+      根因与 Infrastructure 相同：SQLite 3.53.4 的 buildTransitive/net471/SQLite.props
+      在 "RuntimeIdentifier 为空 且 Platform 为 AnyCPU" 时直接报
+      "This package does not support Any CPU builds"，而且失败模式是静默的——
+      编译照过，只是 runtimes\win-x64\native\e_sqlite3.dll 不再进输出目录，
+      运行期 SQLitePCL 才炸。这里 App 通过 ProjectReference 消费 Infrastructure，
+      两个属性齐全才能保证原生库随发布目录一起落地。
     -->
-    <WindowsAppSDKSelfContained Condition="'$(WindowsAppSDKSelfContained)' == ''">true</WindowsAppSDKSelfContained>
-    <SelfContained Condition="'$(SelfContained)' == ''">false</SelfContained>
-    <!-- 托盘/窗口图标占位（Assets\AppIcon.ico） -->
-    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+    <!-- bindingRedirect 由 SDK 自动生成，不需要手写 App.config。 -->
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+    <!--
+      NU1701/NU1702：netstandard2.0 资产被按 net48 兼容面解析（CommunityToolkit.WinUI.Notifications、
+      Microsoft.Windows.SDK.Contracts 等），属于预期内行为，不是错误。阶段 0 探针已确认
+      这些包在 net48 上功能完整。
+    -->
+    <NoWarn>$(NoWarn);NU1701;NU1702</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.250606001" />
-    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
-    <PackageReference Include="H.NotifyIcon.WinUI" Version="2.4.1" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="PolySharp" Version="1.16.0" PrivateAssets="all" />
+    <!-- 托盘图标。注意：命名空间是 H.NotifyIcon（不是 H.NotifyIcon.Wpf），后者只是包名。 -->
+    <PackageReference Include="H.NotifyIcon.Wpf" Version="2.4.1" />
+    <!--
+      阶段 5 才用：WinRT toast 通知在 net48 上的可用通道。
+      net48 没有 Windows App SDK，只能走 CommunityToolkit 的兼容层
+      （ToastNotificationManagerCompat）；阶段 2 先把包挂上，避免阶段 5 再改一次 csproj。
+      探针结论见 .tmp/net48-probe/REPORT.md 第 5 项。
+    -->
+    <PackageReference Include="CommunityToolkit.WinUI.Notifications" Version="7.1.2" />
+    <!-- 显式钉住版本：Toolkit.Notifications 的传递依赖，提供 toast 所需的 86 个 winmd 引用。 -->
+    <PackageReference Include="Microsoft.Windows.SDK.Contracts" Version="10.0.19041.1" />
   </ItemGroup>
 
   <ItemGroup>
@@ -59,9 +71,39 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Update="Assets\**">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
+    <!-- net48 上 System.Net.Http / System.Drawing 都是独立程序集，SDK 不会自动引用。 -->
+    <Reference Include="System.Net.Http" />
+    <Reference Include="System.Drawing" />
+    <!-- System.Windows.Automation.AutomationProperties（托盘菜单项的无障碍名称） -->
+    <Reference Include="UIAutomationTypes" />
+    <Using Include="System.Net.Http" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      【阶段 2 临时】四个页面仍未从 WinUI 控件迁到 WPF（NavigationView / NumberBox /
+      InfoBar / ContentDialog 等在 WPF 里都不存在），因此暂时不参与编译。
+      文件仍在仓库里，阶段 3/4 完成 XAML 迁移后删掉这两行即可自动重新纳入。
+      同步被摘掉的还有 AppCompositionRoot.CreatePage 的具体分支（已留 TODO）。
+    -->
+    <Page Remove="Pages\**\*.xaml" />
+    <Compile Remove="Pages\**\*.xaml.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 与 Core / Infrastructure 复用同一份 System.Threading.Lock 垫片源文件（链接而非拷贝）。 -->
+    <Compile Include="..\StreamingAggregation.Core\Compatibility\SystemThreadingLock.cs"
+             Link="Compatibility\SystemThreadingLock.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      资源一律复制到输出目录。用 Include 而不是 Update：SDK 的默认 glob 把 Assets\**
+      归到 None 项，Update 只会去改「已存在的同类型项」，对 None 不生效——
+      WinUI 时代靠 WindowsAppSDKSelfContained 的 props 把它们转成 Content，
+      现在那个 props 已经没了，不显式 Include 就会静默不落盘。
+    -->
+    <Content Include="Assets\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
