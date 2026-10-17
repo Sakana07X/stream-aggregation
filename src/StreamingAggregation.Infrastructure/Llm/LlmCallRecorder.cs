@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using StreamingAggregation.Core.Abstractions;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Infrastructure.Persistence;
 
 namespace StreamingAggregation.Infrastructure.Llm;
@@ -181,7 +182,7 @@ public sealed record LlmCallRecord
 
         return composed.Length <= MaxErrorMessageChars
             ? composed
-            : string.Concat(composed.AsSpan(0, MaxErrorMessageChars), "…");
+            : composed[..MaxErrorMessageChars] + "…";
     }
 
     private static long ToMilliseconds(TimeSpan duration)
@@ -243,7 +244,7 @@ public sealed class LlmCallRecorder : ILlmCallRecorder
         IClock? clock = null,
         Action<LlmDiagnostic>? diagnostics = null)
     {
-        ArgumentNullException.ThrowIfNull(connectionFactory);
+        Guard.NotNull(connectionFactory);
 
         _connectionFactory = connectionFactory;
         _clock = clock ?? SystemClock.Instance;
@@ -253,7 +254,7 @@ public sealed class LlmCallRecorder : ILlmCallRecorder
     /// <inheritdoc />
     public async Task RecordAsync(LlmCallRecord record, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(record);
+        Guard.NotNull(record);
 
         try
         {
@@ -275,8 +276,8 @@ public sealed class LlmCallRecorder : ILlmCallRecorder
 
     private async Task InsertAsync(LlmCallRecord record, CancellationToken cancellationToken)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = InsertSql;
         command
             .Bind("$id", record.Id)

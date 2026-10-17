@@ -1,4 +1,5 @@
 using StreamingAggregation.Core.Abstractions;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Core.Aggregation;
@@ -43,8 +44,8 @@ public sealed class TimeWindowAggregator : IAggregationWindow
         IMessageStore? messageStore = null,
         IReadOnlyDictionary<string, string>? groupNames = null)
     {
-        ArgumentNullException.ThrowIfNull(options);
-        ArgumentNullException.ThrowIfNull(clock);
+        Guard.NotNull(options, nameof(options));
+        Guard.NotNull(clock, nameof(clock));
 
         _options = options;
         _windowDuration = options.WindowDuration;
@@ -58,9 +59,9 @@ public sealed class TimeWindowAggregator : IAggregationWindow
     public Task AddMessageAsync(Message message, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        ArgumentNullException.ThrowIfNull(message);
-        ArgumentException.ThrowIfNullOrWhiteSpace(message.MessageId, nameof(message.MessageId));
-        ArgumentException.ThrowIfNullOrWhiteSpace(message.GroupId, nameof(message.GroupId));
+        Guard.NotNull(message, nameof(message));
+        Guard.NotNullOrWhiteSpace(message.MessageId, nameof(message.MessageId));
+        Guard.NotNullOrWhiteSpace(message.GroupId, nameof(message.GroupId));
 
         var windowStart = GetWindowStart(_clock.Now);
         lock (_gate)
@@ -147,17 +148,18 @@ public sealed class TimeWindowAggregator : IAggregationWindow
         {
             var stats = new Dictionary<string, AggregationWindowStats>(_buckets.Count + _counters.Count, StringComparer.Ordinal);
 
-            foreach (var (groupId, group) in _buckets)
+            foreach (var entry in _buckets)
             {
-                stats[groupId] = BuildStats(groupId, group, _counters.GetValueOrDefault(groupId));
+                _counters.TryGetValue(entry.Key, out var counters);
+                stats[entry.Key] = BuildStats(entry.Key, entry.Value, counters);
             }
 
             // 已清空全部窗口但本进程产出过批次的群组也要可见，便于界面展示历史产出。
-            foreach (var (groupId, counters) in _counters)
+            foreach (var entry in _counters)
             {
-                if (!stats.ContainsKey(groupId))
+                if (!stats.ContainsKey(entry.Key))
                 {
-                    stats[groupId] = BuildStats(groupId, null, counters);
+                    stats[entry.Key] = BuildStats(entry.Key, null, entry.Value);
                 }
             }
 
@@ -171,7 +173,7 @@ public sealed class TimeWindowAggregator : IAggregationWindow
         DateTime resumeAfter,
         CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(groupIds);
+        Guard.NotNull(groupIds, nameof(groupIds));
         var messageStore = _messageStore
             ?? throw new InvalidOperationException("未注入 IMessageStore，无法从存储重建未关闭窗口。");
 
@@ -308,7 +310,7 @@ public sealed class TimeWindowAggregator : IAggregationWindow
 
     private AggregationWindowStats BuildStats(string groupId, Dictionary<long, WindowBucket>? group, GroupCounters? counters)
     {
-        var newest = group is null || group.Count == 0 ? null : group.Values.MaxBy(bucket => bucket.WindowStart);
+        var newest = LatestBucket(group);
         return new AggregationWindowStats
         {
             GroupId = groupId,
@@ -324,6 +326,35 @@ public sealed class TimeWindowAggregator : IAggregationWindow
             DuplicateCount = counters?.Duplicates ?? 0,
             MaxMessagesPerWindow = _options.MaxMessagesPerWindow,
         };
+    }
+
+    /// <summary>
+    /// 取 <paramref name="group"/> 里窗口起点最晚的那个桶；没有未关闭的窗口时返回
+    /// <see langword="null"/>。
+    /// <para>
+    /// 原实现是 <c>group.Values.MaxBy(bucket =&gt; bucket.WindowStart)</c>，但
+    /// <c>Enumerable.MaxBy</c> 是 .NET 6 才有的 LINQ 方法，net48 上不存在。
+    /// 这里手写等价版本，并保留它"并列时返回最先出现的那一个"的语义
+    /// （只在严格变大时才替换），以免统计结果在同起点多桶时发生漂移。
+    /// </para>
+    /// </summary>
+    private static WindowBucket? LatestBucket(Dictionary<long, WindowBucket>? group)
+    {
+        if (group is null || group.Count == 0)
+        {
+            return null;
+        }
+
+        WindowBucket? newest = null;
+        foreach (var bucket in group.Values)
+        {
+            if (newest is null || bucket.WindowStart > newest.WindowStart)
+            {
+                newest = bucket;
+            }
+        }
+
+        return newest;
     }
 
     private string ResolveGroupName(string groupId)

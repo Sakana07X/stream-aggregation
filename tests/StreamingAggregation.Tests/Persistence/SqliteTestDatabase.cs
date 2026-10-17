@@ -63,11 +63,15 @@ internal sealed class SqliteTestDatabase : IDisposable
         var columnNames = columns.Split(',').Select(static column => column.Trim()).ToArray();
         var placeholders = string.Join(", ", columnNames.Select(static column => $"${column}"));
 
-        await using var connection = await Connections.OpenAsync();
-        await using var transaction = connection.BeginTransaction(deferred: false);
+        // net48 的 Microsoft.Data.Sqlite 里 SqliteConnection / SqliteTransaction /
+        // SqliteCommand 都没有实现 IAsyncDisposable，所以只能用同步 using。
+        // 提前 Dispose 与 await using 析构的时机等价（同作用域退出），
+        // 与 Infrastructure 各仓储的写法保持一致。
+        using var connection = await Connections.OpenAsync();
+        using var transaction = connection.BeginTransaction(deferred: false);
         foreach (var row in values)
         {
-            await using var command = connection.CreateCommand();
+            using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = $"INSERT INTO {table} ({columns}) VALUES ({placeholders});";
             for (var index = 0; index < columnNames.Length; index++)
@@ -78,7 +82,8 @@ internal sealed class SqliteTestDatabase : IDisposable
             await command.ExecuteNonQueryAsync();
         }
 
-        await transaction.CommitAsync();
+        // net48 的 SqliteTransaction 没有 CommitAsync：提交本身是同步的（sqlite3_exec）。
+        transaction.Commit();
     }
 
     /// <summary>
@@ -90,8 +95,8 @@ internal sealed class SqliteTestDatabase : IDisposable
     /// <param name="sql">要执行的语句，由测试代码写死，不是外部输入。</param>
     public async Task ExecuteAsync(string sql)
     {
-        await using SqliteConnection connection = await Connections.OpenAsync();
-        await using SqliteCommand command = connection.CreateCommand();
+        using SqliteConnection connection = await Connections.OpenAsync();
+        using SqliteCommand command = connection.CreateCommand();
         command.CommandText = sql;
 
         await command.ExecuteNonQueryAsync();

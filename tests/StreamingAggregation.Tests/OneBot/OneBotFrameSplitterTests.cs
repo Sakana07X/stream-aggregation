@@ -20,7 +20,9 @@ public sealed class OneBotFrameSplitterTests
     private static IReadOnlyList<string> SplitAsText(byte[] frame)
         => OneBotFrameSplitter
             .Split(frame)
-            .Select(static value => Encoding.UTF8.GetString(value.Span))
+            // net48 的 Encoding.GetString 没有 ReadOnlySpan<byte> / ReadOnlyMemory<byte> 重载，
+            // 先 ToArray() 再解码（与 OneBotWebSocketClient 的做法一致）。
+            .Select(static value => Encoding.UTF8.GetString(value.ToArray()))
             .ToList();
 
     /// <summary>单值帧：产出且仅产出该值。</summary>
@@ -166,7 +168,7 @@ public sealed class OneBotFrameSplitterTests
         {
             foreach (var value in OneBotFrameSplitter.Split(Encoding.UTF8.GetBytes(first + """{"id":2""")))
             {
-                yielded.Add(Encoding.UTF8.GetString(value.Span));
+                yielded.Add(Encoding.UTF8.GetString(value.ToArray()));
             }
         });
 

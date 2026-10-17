@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using StreamingAggregation.Core;
 using StreamingAggregation.Core.Abstractions;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Infrastructure.Persistence;
@@ -54,7 +55,7 @@ public sealed class BatchRepository : IBatchStore
     /// <param name="clock">时间源；不传时使用 UTC 系统时钟。</param>
     public BatchRepository(ISqliteConnectionFactory connectionFactory, IClock? clock = null)
     {
-        ArgumentNullException.ThrowIfNull(connectionFactory);
+        Guard.NotNull(connectionFactory);
 
         _connectionFactory = connectionFactory;
         _clock = clock ?? SystemClock.Instance;
@@ -63,13 +64,13 @@ public sealed class BatchRepository : IBatchStore
     /// <summary>保存批次与其携带的消息（同一事务）。</summary>
     public async Task SaveAsync(AggregationBatch batch, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(batch);
-        ArgumentNullException.ThrowIfNull(batch.Messages, nameof(batch.Messages));
+        Guard.NotNull(batch);
+        Guard.NotNull(batch.Messages, nameof(batch.Messages));
 
         var messageIds = batch.Messages.Select(static message => message.MessageId).ToArray();
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var transaction = connection.BeginTransaction(deferred: false);
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var transaction = connection.BeginTransaction(deferred: false);
 
         foreach (var message in batch.Messages)
         {
@@ -78,20 +79,22 @@ public sealed class BatchRepository : IBatchStore
 
         await UpsertBatchAsync(connection, transaction, batch, messageIds, cancellationToken).ConfigureAwait(false);
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        // net48 的 SqliteTransaction 没有 CommitAsync：提交本身是同步的（sqlite3_exec），
+        // 取消令牌在提交前那几轮 ExecuteNonQueryAsync 上就已经生效，这里不再重复检查。
+        transaction.Commit();
     }
 
     /// <inheritdoc />
     public async Task<AggregationBatch?> GetByIdAsync(string id, CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(id, nameof(id));
+        Guard.NotNullOrWhiteSpace(id, nameof(id));
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = $"SELECT {SelectColumns} FROM aggregation_batches WHERE id = $id;";
         command.Bind("$id", id);
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             return null;
@@ -105,7 +108,10 @@ public sealed class BatchRepository : IBatchStore
         var windowStart = reader.GetDateTime(3);
         var windowEnd = reader.GetDateTime(4);
         var status = ToBatchStatus(reader.GetInt32(5));
-        await reader.DisposeAsync().ConfigureAwait(false);
+
+        // 必须在读同一连接上的下一条语句之前释放 reader：SQLite 一条连接上同时只有一个
+        // 活跃语句。提前 Dispose 与 await using 析构的时机等价，而 net48 只有同步 Dispose。
+        reader.Dispose();
 
         var messages = await LoadMessagesAsync(connection, messageIds, cancellationToken).ConfigureAwait(false);
         return new AggregationBatch
@@ -123,11 +129,11 @@ public sealed class BatchRepository : IBatchStore
     /// <summary>取所有 <see cref="BatchStatus.Pending"/> 批次，按窗口结束时间升序（先到先处理）。</summary>
     public async Task<IReadOnlyList<AggregationBatch>> GetPendingAsync(CancellationToken cancellationToken = default)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         var batches = new List<AggregationBatch>();
         var messageIdLists = new List<IReadOnlyList<string>>();
-        await using (var command = connection.CreateCommand())
+        using (var command = connection.CreateCommand())
         {
             command.CommandText = $"""
                 SELECT {SelectColumns}
@@ -137,7 +143,7 @@ public sealed class BatchRepository : IBatchStore
                 """;
             command.Bind("$status", (int)BatchStatus.Pending);
 
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 messageIdLists.Add(reader.GetStringList(6));
@@ -174,7 +180,7 @@ public sealed class BatchRepository : IBatchStore
     {
         var now = SqliteTime.ToStorage(_clock.Now);
 
-        await using var command = connection.CreateCommand();
+        using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = UpsertBatchSql;
         command
@@ -198,9 +204,9 @@ public sealed class BatchRepository : IBatchStore
         Message message,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(message.MessageId, nameof(message.MessageId));
+        Guard.NotNullOrWhiteSpace(message.MessageId, nameof(message.MessageId));
 
-        await using var command = connection.CreateCommand();
+        using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = UpsertMessageSql;
         command
@@ -219,7 +225,7 @@ public sealed class BatchRepository : IBatchStore
         CancellationToken cancellationToken)
     {
         var messagesById = await LoadMessagesByIdAsync(connection, messageIds, cancellationToken).ConfigureAwait(false);
-        return messageIds.Select(id => messagesById.GetValueOrDefault(id)).OfType<Message>().ToArray();
+        return ResolveMessages(messageIds, messagesById);
     }
 
     private static async Task<Dictionary<string, Message>> LoadMessagesByIdAsync(
@@ -234,7 +240,7 @@ public sealed class BatchRepository : IBatchStore
         }
 
         var result = new Dictionary<string, Message>(distinctIds.Length, StringComparer.Ordinal);
-        await using var command = connection.CreateCommand();
+        using var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT message_id, group_id, sender, text, timestamp
             FROM messages
@@ -245,7 +251,7 @@ public sealed class BatchRepository : IBatchStore
             command.Bind("$id" + index.ToString(System.Globalization.CultureInfo.InvariantCulture), distinctIds[index]);
         }
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             result[reader.GetString(0)] = MessageRepository.ReadMessage(reader);
@@ -254,15 +260,29 @@ public sealed class BatchRepository : IBatchStore
         return result;
     }
 
+    /// <summary>
+    /// 按批次里的 ID 顺序回填消息；已被保留期清理掉的 ID 直接跳过。
+    /// </summary>
+    /// <remarks>
+    /// net48 没有 <c>CollectionExtensions.GetValueOrDefault</c>（.NET Core 2.0+），
+    /// 用 <see cref="IDictionary{TKey, TValue}.TryGetValue"/> 表达同一语义：
+    /// 取不到就是 <see langword="null"/>，随后被 <c>OfType&lt;Message&gt;</c> 过滤掉。
+    /// </remarks>
     private static IReadOnlyList<Message> ResolveMessages(
         IReadOnlyList<string> messageIds,
         IReadOnlyDictionary<string, Message> messagesById) =>
-        messageIds.Select(id => messagesById.GetValueOrDefault(id)).OfType<Message>().ToArray();
+        messageIds
+            .Select(id => messagesById.TryGetValue(id, out var message) ? message : null)
+            .OfType<Message>()
+            .ToArray();
 
     private static BatchStatus ToBatchStatus(int stored)
     {
         var status = (BatchStatus)stored;
-        if (!Enum.IsDefined(status))
+
+        // net48 的 Enum.IsDefined 只有 (Type, object) 重载；传已装箱的枚举值，
+        // 语义与 .NET 5+ 的 Enum.IsDefined<TEnum>(TEnum) 一致。
+        if (!Enum.IsDefined(typeof(BatchStatus), status))
         {
             throw new InvalidOperationException($"aggregation_batches.status 存在非法取值：{stored}。");
         }

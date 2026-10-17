@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using StreamingAggregation.Core.Abstractions;
+using StreamingAggregation.Core.Diagnostics;
 
 namespace StreamingAggregation.Infrastructure.Persistence;
 
@@ -54,7 +55,7 @@ public sealed class RetentionCleaner
     /// <param name="clock">时间源；不传时使用 UTC 系统时钟。</param>
     public RetentionCleaner(ISqliteConnectionFactory connectionFactory, IClock? clock = null)
     {
-        ArgumentNullException.ThrowIfNull(connectionFactory);
+        Guard.NotNull(connectionFactory);
 
         _connectionFactory = connectionFactory;
         _clock = clock ?? SystemClock.Instance;
@@ -69,13 +70,13 @@ public sealed class RetentionCleaner
         TimeSpan retention,
         CancellationToken cancellationToken = default)
     {
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(retention, TimeSpan.Zero, nameof(retention));
+        Guard.ThrowIfLessThanOrEqual(retention, TimeSpan.Zero, nameof(retention));
 
         var cutoff = _clock.Now - retention;
         var cutoffStorage = SqliteTime.ToStorage(cutoff);
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var transaction = connection.BeginTransaction(deferred: false);
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var transaction = connection.BeginTransaction(deferred: false);
 
         // 先删批次：digests.batch_id 上的外键是 ON DELETE CASCADE，摘要会跟着消失，
         // 所以要在删除前先把会被级联带走的行数统计出来。
@@ -92,7 +93,8 @@ public sealed class RetentionCleaner
         var processedEvents = await ExecuteDeleteAsync(
             connection, transaction, DeleteProcessedEventsSql, cutoffStorage, cancellationToken).ConfigureAwait(false);
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        // net48 的 SqliteTransaction 没有 CommitAsync：提交本身是同步的。
+        transaction.Commit();
 
         CheckpointWal(connection);
 
@@ -106,7 +108,7 @@ public sealed class RetentionCleaner
         string cutoffStorage,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = sql;
         command.Bind("$cutoff", cutoffStorage);
@@ -120,7 +122,7 @@ public sealed class RetentionCleaner
         string cutoffStorage,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = sql;
         command.Bind("$cutoff", cutoffStorage);

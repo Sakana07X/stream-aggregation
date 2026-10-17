@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Text;
 using StreamingAggregation.Core.Abstractions;
 using StreamingAggregation.Core.Configuration;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 using StreamingAggregation.Infrastructure.Persistence;
 
@@ -83,10 +84,10 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
         IClock? clock = null,
         LlmResultMapper? resultMapper = null)
     {
-        ArgumentNullException.ThrowIfNull(settingsProvider);
-        ArgumentNullException.ThrowIfNull(secretStore);
-        ArgumentNullException.ThrowIfNull(httpClient);
-        ArgumentException.ThrowIfNullOrWhiteSpace(apiKeySecretKey);
+        Guard.NotNull(settingsProvider, nameof(settingsProvider));
+        Guard.NotNull(secretStore, nameof(secretStore));
+        Guard.NotNull(httpClient, nameof(httpClient));
+        Guard.NotNullOrWhiteSpace(apiKeySecretKey, nameof(apiKeySecretKey));
 
         _settingsProvider = settingsProvider;
         _secretStore = secretStore;
@@ -134,13 +135,13 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
             clock,
             resultMapper)
     {
-        ArgumentNullException.ThrowIfNull(settings);
+        Guard.NotNull(settings, nameof(settings));
     }
 
     /// <inheritdoc />
     public async Task<LlmResult> SummarizeAsync(AggregationBatch batch, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(batch);
+        Guard.NotNull(batch, nameof(batch));
 
         var stopwatch = Stopwatch.StartNew();
         var settings = ReadSettings();
@@ -455,9 +456,20 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
     /// 有上限地读取响应正文；读到上限即停止，不会把整页内容读进内存。
     /// 异常按原样抛给调用方，由 <see cref="SendAsync"/> 归类。
     /// </summary>
+    /// <remarks>
+    /// net48 的三条限制：<c>HttpContent.ReadAsStreamAsync()</c> 没有
+    /// <see cref="CancellationToken"/> 重载（.NET 5+）；<c>StreamReader.ReadAsync</c> 也没有
+    /// <c>(Memory&lt;char&gt;, CancellationToken)</c> 与可取消的
+    /// <see cref="Stream.ReadAsync(byte[], int, int, CancellationToken)"/>；
+    /// 而 .NET Framework 的 <c>HttpClient</c> 在取流之前会先把整个响应体缓冲进内存
+    /// （<c>ResponseHeadersRead</c> 只延后<b>响应头</b>，不提供真正的流式响应体）。
+    /// 因此：取消改为在循环边界检查（单次读取最多 4 KiB，响应延迟不会因此被放大），
+    /// 而"读到上限即停止、不把整页读进内存"这一条只能约束最终字符串的长度，
+    /// 约束不到中间那次缓冲——这是 net48 的硬限制，不是本方法的取舍。
+    /// </remarks>
     private static async Task<string> ReadBoundedAsync(HttpContent content, int maxChars, CancellationToken cancellationToken)
     {
-        await using var stream = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        using var stream = await content.ReadAsStreamAsync().ConfigureAwait(false);
         using var reader = new StreamReader(stream, Encoding.UTF8);
 
         var buffer = new char[4096];
@@ -465,7 +477,9 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
 
         while (builder.Length < maxChars)
         {
-            var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var read = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
             if (read == 0)
             {
                 break;
@@ -483,25 +497,42 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
         HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden => "（API Key 可能无效或缺少该模型权限）",
         HttpStatusCode.NotFound => "（端点路径或模型名可能有误）",
         HttpStatusCode.RequestTimeout => "（服务端超时）",
-        HttpStatusCode.TooManyRequests => "（触发限流，可退避后重试）",
+
+        // net48 的 HttpStatusCode 没有 TooManyRequests（.NET Core 2.1+），用 RFC 6585 的数值。
+        (HttpStatusCode)429 => "（触发限流，可退避后重试）",
+
         >= HttpStatusCode.InternalServerError => "（服务端错误，可重试）",
         _ => string.Empty,
     };
 
     /// <summary>
-    /// 网络异常的描述：带状态码时给状态码，没带时给 .NET 归类的网络错误类型
-    /// （<see cref="HttpRequestError"/>），便于区分 DNS 失败与连接被拒。
+    /// 网络异常的描述。
     /// </summary>
-    private static string DescribeHttpFailure(HttpRequestException exception) =>
-        exception.StatusCode is { } status
-            ? $"HTTP {(int)status}：{exception.Message}"
-            : $"网络错误（{exception.HttpRequestError}）：{exception.Message}";
+    /// <remarks>
+    /// net48 的 <see cref="HttpRequestException"/> 既没有 <c>StatusCode</c> 也没有
+    /// <c>HttpRequestError</c>（两者都是 .NET 5 才加的成员），因此拿不到状态码，
+    /// 改用内层异常的类型名给出粗粒度归因（DNS 失败 / 连接被拒 / 超时各自不同的
+    /// 异常类型），消息正文仍是 <see cref="Exception.Message"/> 原样。
+    /// 另外 net48 的 <c>HttpClient</c> 也不会为非 2xx 抛 <see cref="HttpRequestException"/>，
+    /// 那条路径由 <c>IsSuccessStatusCode</c> 分支处理。
+    /// </remarks>
+    private static string DescribeHttpFailure(HttpRequestException exception)
+    {
+        var cause = exception.InnerException;
+        var kind = cause is null ? exception.GetType().Name : cause.GetType().Name;
+        return $"网络错误（{kind}）：{exception.Message}";
+    }
 
     /// <summary>兜底脱敏：即使未来新增文案，也不至于把凭据写进日志或数据库。</summary>
+    /// <remarks>
+    /// net48 没有 <c>string.Replace(string, string, StringComparison)</c>（.NET Core 2.1+）。
+    /// 两参数的 <see cref="string.Replace(string, string)"/> 本来就是序数比较，
+    /// 语义与 <see cref="StringComparison.Ordinal"/> 完全一致。
+    /// </remarks>
     private static string Redact(string message, string secret) =>
         string.IsNullOrEmpty(secret)
             ? message
-            : message.Replace(secret, "***", StringComparison.Ordinal);
+            : message.Replace(secret, "***");
 
     private void Log(LlmDiagnosticLevel level, string message, Exception? exception) =>
         _diagnostics?.Invoke(new LlmDiagnostic(level, message, exception));
@@ -573,7 +604,7 @@ public sealed class OpenAiCompatibleClient : ISummarizationClient
             DigestMapping mapping,
             int promptChars)
         {
-            ArgumentNullException.ThrowIfNull(mapping);
+            Guard.NotNull(mapping, nameof(mapping));
 
             // 映射器最多给一个行动项；没有就给空列表，消费点不必判空。
             var actionItems = mapping.ActionItem is { } action

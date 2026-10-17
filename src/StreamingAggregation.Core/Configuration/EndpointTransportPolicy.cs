@@ -15,15 +15,18 @@ public static class EndpointTransportPolicy
     /// </summary>
     public static bool IsLoopback(string? host)
     {
-        if (string.IsNullOrWhiteSpace(host))
+        // net48 的 string.IsNullOrWhiteSpace 没有 [NotNullWhen(false)]，
+        // 编译器无法据此收窄 host，所以改成先 Trim 再判空——语义等价
+        // （纯空白 Trim 后为空串，原本也会一路判到末尾 return false）。
+        var h = host?.Trim();
+        if (h is null || h.Length == 0)
         {
             return false;
         }
 
-        var h = host.Trim();
-
         // 带尾点的主机名（如 localhost.）一律视为远程
-        if (h.EndsWith('.'))
+        // net48 的 string.EndsWith 没有 char 重载，用 Ordinal 字符串比较等价替代
+        if (h.EndsWith(".", StringComparison.Ordinal))
         {
             return false;
         }

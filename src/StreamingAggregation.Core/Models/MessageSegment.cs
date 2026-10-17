@@ -1,3 +1,5 @@
+using StreamingAggregation.Core.Diagnostics;
+
 namespace StreamingAggregation.Core.Models;
 
 /// <summary>
@@ -11,7 +13,7 @@ public sealed record MessageSegment
         get => field;
         init
         {
-            ArgumentException.ThrowIfNullOrWhiteSpace(value, nameof(Type));
+            Guard.NotNullOrWhiteSpace(value, nameof(Type));
             field = value;
         }
     }
@@ -22,7 +24,7 @@ public sealed record MessageSegment
         get => field;
         init
         {
-            ArgumentNullException.ThrowIfNull(value, nameof(Data));
+            Guard.NotNull(value, nameof(Data));
             field = value;
         }
     }

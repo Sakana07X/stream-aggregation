@@ -204,10 +204,10 @@ public sealed class TaskRepositoryTests
             await instanceA.SaveAsync(staleCopy with { Action = "test-action-refreshed" });
         });
 
-        inserted.SetResult();
+        inserted.SetResult(true);
         await instanceB.SetCompletedAsync(TaskId, completed: true);
-        statusWritten.SetResult();
-        await refreshTask.WaitAsync(ConcurrencyGuard);
+        statusWritten.SetResult(true);
+        await WaitWithinGuardAsync(refreshTask);
 
         var stored = await GetRequiredAsync(instanceA, TaskId);
 
@@ -237,10 +237,10 @@ public sealed class TaskRepositoryTests
             await instanceA.SaveAsync(staleCopy with { Action = "test-action-refreshed" });
         });
 
-        inserted.SetResult();
+        inserted.SetResult(true);
         await instanceB.SetIgnoredAsync(TaskId, ignored: true);
-        statusWritten.SetResult();
-        await refreshTask.WaitAsync(ConcurrencyGuard);
+        statusWritten.SetResult(true);
+        await WaitWithinGuardAsync(refreshTask);
 
         var stored = await GetRequiredAsync(instanceA, TaskId);
 
@@ -545,7 +545,8 @@ public sealed class TaskRepositoryTests
         Assert.Equal(
             ["test-action-dirty-negative", "test-action-high", "test-action-dirty-high"],
             pending.Select(static item => item.Id));
-        Assert.All(pending, static item => Assert.True(Enum.IsDefined(item.Importance)));
+        // net48 没有泛型 Enum.IsDefined（net5+）：显式传 Type，语义与 item.Importance 一致。
+        Assert.All(pending, static item => Assert.True(Enum.IsDefined(typeof(Importance), item.Importance)));
     }
 
     [Fact]
@@ -726,14 +727,45 @@ public sealed class TaskRepositoryTests
     }
 
     /// <summary>屏障：让续体离开完成线程被唤醒，强制真正的并发交错而不是同线程顺序执行。</summary>
-    private static TaskCompletionSource NewBarrier() =>
+    /// <remarks>
+    /// 必须带 <see cref="TaskCreationOptions.RunContinuationsAsynchronously"/>：
+    /// 缺了它续体会内联在 <c>SetResult</c> 的线程上跑，交错顺序塌成同线程顺序执行，
+    /// 屏障就白设了，这两条用例会从"确定性回归"退化成"偶尔绿"。
+    /// net48 的 <c>TaskCompletionSource</c> 只有泛型版，故取 <c>bool</c> 占位。
+    /// </remarks>
+    private static TaskCompletionSource<bool> NewBarrier() =>
         new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// 带超时兜底地等一个任务：超时抛 <see cref="TimeoutException"/>。
+    /// </summary>
+    /// <remarks>
+    /// net48 没有 <c>Task.WaitAsync(TimeSpan)</c>，语义上等价的替代品就是
+    /// <c>Task.WhenAny(任务, Task.Delay(超时))</c>：<c>WhenAny</c> 本身永不失败，
+    /// 所以还要把原任务重新 await 一次，才能把它的真实异常原样抛出去。
+    /// </remarks>
+    private static async Task WaitWithinGuardAsync(Task task)
+    {
+        // 任务先完成时取消掉计时器，免得空等满 ConcurrencyGuard。
+        // 取消出来的 Task 是 Canceled 而非 Faulted，不触发 UnobservedTaskException。
+        using var timeout = new CancellationTokenSource();
+        Task expired = Task.Delay(ConcurrencyGuard, timeout.Token);
+
+        if (await Task.WhenAny(task, expired) == task)
+        {
+            timeout.Cancel();
+            await task;
+            return;
+        }
+
+        throw new TimeoutException($"并发用例等待超过 {ConcurrencyGuard}。");
+    }
 
     /// <summary>并发发起若干条写入，并留一个超时兜底。</summary>
     private static async Task RunConcurrentlyAsync(params Func<Task>[] operations)
     {
-        await Task.WhenAll(operations.Select(static operation => Task.Run(operation)))
-            .WaitAsync(ConcurrencyGuard);
+        await WaitWithinGuardAsync(
+            Task.WhenAll(operations.Select(static operation => Task.Run(operation))));
     }
 
     /// <summary>
@@ -745,8 +777,8 @@ public sealed class TaskRepositoryTests
     /// <param name="id">目标行。</param>
     private static async Task<object?> ReadColumnAsync(SqliteTestDatabase database, string column, string id)
     {
-        await using SqliteConnection connection = await database.Connections.OpenAsync();
-        await using SqliteCommand command = connection.CreateCommand();
+        using SqliteConnection connection = await database.Connections.OpenAsync();
+        using SqliteCommand command = connection.CreateCommand();
         command.CommandText = $"SELECT {column} FROM tasks WHERE id = $id;";
         command.Parameters.AddWithValue("$id", id);
 

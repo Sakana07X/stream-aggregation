@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text.RegularExpressions;
 using StreamingAggregation.Core;
 using StreamingAggregation.Core.Abstractions;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Infrastructure.Llm;
@@ -84,7 +85,7 @@ public sealed class FallbackDigestBuilder
     /// <param name="clock">时间源，用于摘要创建时间与"明天/3 天后"等相对截止时间的换算。</param>
     public FallbackDigestBuilder(IClock clock)
     {
-        ArgumentNullException.ThrowIfNull(clock);
+        Guard.NotNull(clock);
 
         _clock = clock;
     }
@@ -95,7 +96,7 @@ public sealed class FallbackDigestBuilder
     /// <param name="batch">聚合批次。</param>
     public DigestMapping Build(AggregationBatch batch)
     {
-        ArgumentNullException.ThrowIfNull(batch);
+        Guard.NotNull(batch);
 
         var texts = CollectTexts(batch.Messages);
         var classification = Classify(texts);
@@ -144,11 +145,11 @@ public sealed class FallbackDigestBuilder
             return new Classification(DigestCategory.Normal, string.Empty, Array.Empty<string>());
         }
 
-        var joined = string.Join('\n', texts);
+        var joined = string.Join("\n", texts);
         foreach (var rule in Rules)
         {
             var hits = rule.Keywords
-                .Where(keyword => joined.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                .Where(keyword => joined.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
                 .ToArray();
 
             if (hits.Length > 0)
@@ -182,7 +183,7 @@ public sealed class FallbackDigestBuilder
 
         var body = string.Join("；", excerpts);
         var omitted = texts.Count > MaxMessagesInSummary
-            ? string.Create(CultureInfo.InvariantCulture, $"（其余 {texts.Count - MaxMessagesInSummary} 条略）")
+            ? string.Format(CultureInfo.InvariantCulture, $"（其余 {texts.Count - MaxMessagesInSummary} 条略）")
             : string.Empty;
 
         return Truncate($"本轮共 {texts.Count} 条有效消息：{body}{omitted}", DigestSchemaValidator.MaxSummaryLength);
@@ -191,11 +192,11 @@ public sealed class FallbackDigestBuilder
     private static string ComposeReason(IReadOnlyList<string> texts, Classification classification)
     {
         var basis = classification.Hits.Count > 0
-            ? string.Create(CultureInfo.InvariantCulture, $"命中关键词「{string.Join("、", classification.Hits)}」")
+            ? string.Format(CultureInfo.InvariantCulture, $"命中关键词「{string.Join("、", classification.Hits)}」")
             : "未命中任何关键词";
 
         return Truncate(
-            string.Create(
+            string.Format(
                 CultureInfo.InvariantCulture,
                 $"本地规则摘要（模型未产出可用结果）：对 {texts.Count} 条消息按关键字判定为{classification.Label}，{basis}。"),
             DigestSchemaValidator.MaxReasonLength);
@@ -221,7 +222,7 @@ public sealed class FallbackDigestBuilder
             Action = Truncate(action, DigestSchemaValidator.MaxActionLength),
             Deadline = TryExtractDeadline(action, now),
             Importance = classification.Category == DigestCategory.Urgent ? Importance.High : Importance.Medium,
-            Reason = string.Create(
+            Reason = string.Format(
                 CultureInfo.InvariantCulture,
                 $"本地规则摘要：{classification.Label}信号，关键词「{string.Join("、", classification.Hits)}」。"),
             SourceGroupId = batch.GroupId
@@ -232,7 +233,7 @@ public sealed class FallbackDigestBuilder
     {
         foreach (var text in texts)
         {
-            if (hits.Any(hit => text.Contains(hit, StringComparison.OrdinalIgnoreCase)))
+            if (hits.Any(hit => text.IndexOf(hit, StringComparison.OrdinalIgnoreCase) >= 0))
             {
                 return text;
             }
@@ -310,7 +311,7 @@ public sealed class FallbackDigestBuilder
         }
 
         // 交给 TryParseExact 兜住 2 月 30 日这类不存在的日期。
-        var candidate = string.Create(
+        var candidate = string.Format(
             CultureInfo.InvariantCulture,
             $"{year.Value:D4}-{month.Value:D2}-{day.Value:D2}");
 
@@ -373,7 +374,7 @@ public sealed class FallbackDigestBuilder
     }
 
     private static string CollapseWhitespace(string text)
-        => string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        => string.Join(" ", text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 
     /// <summary>关键词命中结果。</summary>
     private sealed record Classification(DigestCategory Category, string Label, IReadOnlyList<string> Hits);

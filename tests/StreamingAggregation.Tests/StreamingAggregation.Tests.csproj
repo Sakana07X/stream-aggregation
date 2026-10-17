@@ -1,18 +1,53 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!--
+    测试项目。TFM 与被测程序集一起迁到 net48，
+    保证断言跑在真正的 .NET Framework BCL 上
+    （异常消息、字符串比较、区域性差异都按 net48 暴露出来，
+      这正是本次迁移最需要被测到的东西）。
+
+    LangVersion=latest 与 net10 时期保持一致：测试代码同样用了 field 关键字
+    与集合表达式，降到 net48 默认的 7.3 会立刻编译失败。
+  -->
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+    <PlatformTarget>x64</PlatformTarget>
+    <!--
+      与 Infrastructure 保持同一个 RID。原因：本项目通过 ProjectReference 消费
+      Infrastructure 的 SQLite 原生资产（runtimes/win-x64/native/e_sqlite3.dll），
+      若本项目没有 RID，NuGet 的资产选择图与 Infrastructure 不一致，
+      可能出现「编译通过、跑测试时 SQLitePCL 找不到原生库」的静默失败。
+    -->
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+    <NoWarn>$(NoWarn);NU1701;NU1702</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <!--
+      版本支持性（已核对 nuspec 的 lib/ 资产）：
+        Microsoft.NET.Test.Sdk 17.14.1  -> net462 + netcoreapp3.1，net48 可用
+        xunit 2.9.3                     -> netstandard1.1/2.0，net48 可用
+        xunit.runner.visualstudio 3.1.4 -> net472 + net8.0，net48 可用
+      三者都不需要为 net48 降版本，保持原版本号即可。
+    -->
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <!-- 测试代码里的 async 流（IAsyncEnumerable）与 PolySharp 需求同被测程序集 -->
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="PolySharp" Version="1.16.0" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>
@@ -22,6 +57,27 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <!-- 与 Infrastructure 同理：net48 的 ImplicitUsings 不含 System.Net.Http -->
+    <Using Include="System.Net.Http" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!-- net48 上 System.Net.Http 是独立程序集，SDK 不会自动引用 -->
+    <Reference Include="System.Net.Http" />
+  </ItemGroup>
+
+  <!--
+    【刻意不链接 System.Threading.Lock 垫片】
+    Core / Infrastructure 各自把 src\...\Compatibility\SystemThreadingLock.cs 编进本程序集，
+    声明为 internal；Infrastructure 又开了 InternalsVisibleTo("StreamingAggregation.Tests")。
+    如果本项目再链接一份，同一个测试程序集里就会同时看见两个
+    System.Threading.Lock（一个本地 internal、一个经 IVT 导入的 internal），
+    编译器对每一个用到 Lock 的位置报 CS0436 类型冲突警告。
+
+    本项目【不使用】System.Threading.Lock（已全量搜索确认：tests 下零引用），
+    所以正确做法是根本不要引入第二份，冲突从源头消失，而不是靠 #pragma 压制警告。
+    若将来测试真的要用，通过 Infrastructure 的 InternalsVisibleTo 访问那一份即可，
+    不需要在这里重新链接源文件。
+  -->
 
 </Project>

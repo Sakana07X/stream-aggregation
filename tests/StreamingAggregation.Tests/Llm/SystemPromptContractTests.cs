@@ -21,7 +21,8 @@ public sealed class SystemPromptContractTests
     public static TheoryData<string> CategoryValuesData()
     {
         var data = new TheoryData<string>();
-        foreach (var value in Enum.GetNames<DigestCategory>())
+        // net48 没有泛型 Enum.GetNames<TEnum>()（net5+）：显式传 Type。
+        foreach (var value in Enum.GetNames(typeof(DigestCategory)))
         {
             data.Add(value);
         }
@@ -33,7 +34,8 @@ public sealed class SystemPromptContractTests
     public static TheoryData<string> ImportanceValuesData()
     {
         var data = new TheoryData<string>();
-        foreach (var value in Enum.GetNames<Importance>())
+        // net48 没有泛型 Enum.GetNames<TEnum>()（net5+）：显式传 Type。
+        foreach (var value in Enum.GetNames(typeof(Importance)))
         {
             data.Add(value);
         }
@@ -136,7 +138,10 @@ public sealed class SystemPromptContractTests
     private static string[] ExtractExamplePayloads()
     {
         return LlmRequestBuilder.DefaultSystemPrompt
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            // net48 既没有 Split(char, StringSplitOptions) 也没有 TrimEntries（net6+）：
+            // 先按 '\n' 切并去掉空行，再逐行 Trim —— 与 RemoveEmptyEntries | TrimEntries 结果一致。
+            .Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(static line => line.Trim())
             .Where(line => line.StartsWith("{\"category\"", StringComparison.Ordinal))
             .ToArray();
     }

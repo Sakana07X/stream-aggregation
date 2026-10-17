@@ -57,7 +57,12 @@ public sealed class TestWebSocketServer : IAsyncDisposable
     /// <summary>启动服务器，开始监听连接。</summary>
     public Task StartAsync()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        // net48 没有 ObjectDisposedException.ThrowIf（net7+）：手动补，语义一致。
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(TestWebSocketServer));
+        }
+
         if (_started)
         {
             return Task.CompletedTask;
@@ -84,7 +89,9 @@ public sealed class TestWebSocketServer : IAsyncDisposable
         {
             try
             {
-                await client.GetStream().WriteAsync(frame, cancellationToken);
+                // net48 的 NetworkStream 只有 (byte[], int, int, CancellationToken) 这一档，
+                // 没有 (byte[], CancellationToken) / (ReadOnlyMemory<byte>, ...) 重载。
+                await client.GetStream().WriteAsync(frame, 0, frame.Length, cancellationToken);
             }
             catch
             {
@@ -95,20 +102,33 @@ public sealed class TestWebSocketServer : IAsyncDisposable
 
     private async Task AcceptLoopAsync(CancellationToken cancellationToken)
     {
-        while (!cancellationToken.IsCancellationRequested)
+        // net48 的 TcpListener 只有无参 AcceptTcpClientAsync()，没有接受取消令牌的重载（net6+）。
+        // 标准的绕法：把令牌注册成「取消即 Stop()」，挂起的 Accept 会以 ObjectDisposedException 落空，
+        // 于是取消路径既能立刻返回，又不必再开一条线程专门去轮询。
+        using (cancellationToken.Register(
+                   static state => ((TcpListener)state!).Stop(),
+                   _listener))
         {
-            try
+            while (!cancellationToken.IsCancellationRequested)
             {
-                var client = await _listener.AcceptTcpClientAsync(cancellationToken);
-                _ = HandleClientAsync(client, cancellationToken);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (SocketException)
-            {
-                // listener 已停止。
+                try
+                {
+                    var client = await _listener.AcceptTcpClientAsync();
+                    _ = HandleClientAsync(client, cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
+                {
+                    // 取消触发上面注册的 Stop()，挂起的 Accept 就此落空——收尾结束。
+                    break;
+                }
+                catch (SocketException)
+                {
+                    // listener 已停止。
+                }
             }
         }
     }
@@ -275,7 +295,7 @@ public sealed class TestWebSocketServer : IAsyncDisposable
         var read = 0;
         while (read < count)
         {
-            var n = await stream.ReadAsync(buffer.AsMemory(read, count - read), cancellationToken);
+            var n = await stream.ReadAsync(buffer, read, count - read, cancellationToken);
             if (n == 0)
             {
                 return null;
@@ -295,7 +315,7 @@ public sealed class TestWebSocketServer : IAsyncDisposable
         var buffer = new byte[1];
         while (true)
         {
-            var n = await stream.ReadAsync(buffer, cancellationToken);
+            var n = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
             if (n == 0)
             {
                 break;
@@ -344,7 +364,7 @@ public sealed class TestWebSocketServer : IAsyncDisposable
             $"Sec-WebSocket-Accept: {acceptKey}\r\n" +
             $"\r\n";
         var bytes = Encoding.UTF8.GetBytes(response);
-        await stream.WriteAsync(bytes, cancellationToken);
+        await stream.WriteAsync(bytes, 0, bytes.Length, cancellationToken);
     }
 
     private static async Task Send401ResponseAsync(NetworkStream stream, CancellationToken cancellationToken)
@@ -355,7 +375,7 @@ public sealed class TestWebSocketServer : IAsyncDisposable
             "Connection: close\r\n" +
             "\r\n";
         var bytes = Encoding.UTF8.GetBytes(response);
-        await stream.WriteAsync(bytes, cancellationToken);
+        await stream.WriteAsync(bytes, 0, bytes.Length, cancellationToken);
     }
 
     private static async Task Send400ResponseAsync(NetworkStream stream, CancellationToken cancellationToken)
@@ -366,7 +386,7 @@ public sealed class TestWebSocketServer : IAsyncDisposable
             "Connection: close\r\n" +
             "\r\n";
         var bytes = Encoding.UTF8.GetBytes(response);
-        await stream.WriteAsync(bytes, cancellationToken);
+        await stream.WriteAsync(bytes, 0, bytes.Length, cancellationToken);
     }
 
     private static async Task SendPongAsync(
@@ -375,13 +395,13 @@ public sealed class TestWebSocketServer : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var frame = BuildFrame(PongFrameOpcode, payload);
-        await stream.WriteAsync(frame, cancellationToken);
+        await stream.WriteAsync(frame, 0, frame.Length, cancellationToken);
     }
 
     private static async Task SendCloseAsync(NetworkStream stream, CancellationToken cancellationToken)
     {
         var frame = BuildFrame(CloseFrameOpcode, Array.Empty<byte>());
-        await stream.WriteAsync(frame, cancellationToken);
+        await stream.WriteAsync(frame, 0, frame.Length, cancellationToken);
     }
 
     private static byte[] EncodeTextFrame(string message)
@@ -420,7 +440,9 @@ public sealed class TestWebSocketServer : IAsyncDisposable
 
     private static string ComputeAcceptKey(string secWebSocketKey)
     {
-        var hash = SHA1.HashData(Encoding.UTF8.GetBytes(secWebSocketKey + WebSocketGuid));
+        // net48 没有静态 SHA1.HashData（net5+）：走一次性的 SHA1.Create().ComputeHash，结果完全相同。
+        using SHA1 sha1 = SHA1.Create();
+        var hash = sha1.ComputeHash(Encoding.UTF8.GetBytes(secWebSocketKey + WebSocketGuid));
         return Convert.ToBase64String(hash);
     }
 

@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Reflection;
 using System.Text;
 using Microsoft.Data.Sqlite;
+using StreamingAggregation.Core.Diagnostics;
 
 namespace StreamingAggregation.Infrastructure.Persistence;
 
@@ -60,8 +61,8 @@ public sealed class SchemaMigrator
         ISqliteConnectionFactory connectionFactory,
         Func<IReadOnlyList<MigrationScript>> scriptProvider)
     {
-        ArgumentNullException.ThrowIfNull(connectionFactory);
-        ArgumentNullException.ThrowIfNull(scriptProvider);
+        Guard.NotNull(connectionFactory);
+        Guard.NotNull(scriptProvider);
 
         _connectionFactory = connectionFactory;
         _scriptProvider = scriptProvider;
@@ -95,14 +96,14 @@ public sealed class SchemaMigrator
     /// <summary>读取已应用的迁移记录，按版本升序。</summary>
     public async Task<IReadOnlyList<AppliedMigration>> GetAppliedAsync(CancellationToken cancellationToken = default)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await EnsureVersionTableAsync(connection, cancellationToken).ConfigureAwait(false);
 
-        await using var command = connection.CreateCommand();
+        using var command = connection.CreateCommand();
         command.CommandText = "SELECT version, name, applied_at FROM schema_version ORDER BY version;";
 
         var results = new List<AppliedMigration>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             results.Add(new AppliedMigration(
@@ -117,7 +118,7 @@ public sealed class SchemaMigrator
     /// <summary>发现程序集内嵌的迁移脚本，按版本升序返回。</summary>
     public static IReadOnlyList<MigrationScript> DiscoverScripts(Assembly assembly)
     {
-        ArgumentNullException.ThrowIfNull(assembly);
+        Guard.NotNull(assembly);
 
         var scripts = new List<MigrationScript>();
         foreach (var resourceName in assembly.GetManifestResourceNames())
@@ -151,7 +152,7 @@ public sealed class SchemaMigrator
 
     private async Task<int> ApplyAsync(IReadOnlyList<MigrationScript> scripts, CancellationToken cancellationToken)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await EnsureVersionTableAsync(connection, cancellationToken).ConfigureAwait(false);
 
         var applied = 0;
@@ -177,16 +178,16 @@ public sealed class SchemaMigrator
         CancellationToken cancellationToken)
     {
         // deferred: false → BEGIN IMMEDIATE，直接拿写锁，避免升级锁时的 SQLITE_BUSY。
-        await using var transaction = connection.BeginTransaction(deferred: false);
+        using var transaction = connection.BeginTransaction(deferred: false);
 
-        await using (var scriptCommand = connection.CreateCommand())
+        using (var scriptCommand = connection.CreateCommand())
         {
             scriptCommand.Transaction = transaction;
             scriptCommand.CommandText = script.Sql;
             await scriptCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await using (var recordCommand = connection.CreateCommand())
+        using (var recordCommand = connection.CreateCommand())
         {
             recordCommand.Transaction = transaction;
             recordCommand.CommandText =
@@ -197,12 +198,13 @@ public sealed class SchemaMigrator
             await recordCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        // net48 的 SqliteTransaction 没有 CommitAsync：提交本身是同步的。
+        transaction.Commit();
     }
 
     private static async Task EnsureVersionTableAsync(SqliteConnection connection, CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        using var command = connection.CreateCommand();
         command.CommandText = CreateVersionTableSql;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -212,7 +214,7 @@ public sealed class SchemaMigrator
         int version,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        using var command = connection.CreateCommand();
         command.CommandText = "SELECT EXISTS (SELECT 1 FROM schema_version WHERE version = $version);";
         command.Parameters.AddWithValue("$version", version);
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
@@ -235,7 +237,7 @@ public sealed class SchemaMigrator
 
     private static bool TryParseVersion(string fileName, out int version)
     {
-        var separatorIndex = fileName.IndexOf('_', StringComparison.Ordinal);
+        var separatorIndex = fileName.IndexOf('_');
         var prefix = separatorIndex > 0 ? fileName[..separatorIndex] : fileName;
         return int.TryParse(prefix, NumberStyles.None, CultureInfo.InvariantCulture, out version);
     }

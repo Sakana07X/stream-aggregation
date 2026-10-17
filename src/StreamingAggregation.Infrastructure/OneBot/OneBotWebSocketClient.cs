@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading.Channels;
 using StreamingAggregation.Core.Abstractions;
 using StreamingAggregation.Core.Configuration;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Infrastructure.OneBot;
@@ -59,6 +60,20 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
     private const int DefaultMaxMessageBytes = 4 * 1024 * 1024;
     private const int KeepAliveIntervalSeconds = 30;
 
+    /// <summary>异常链最多向下遍历的层数（含最外层）；同时挡住 InnerException 自引用导致的死循环。</summary>
+    private const int MaxErrorChainHops = 8;
+
+    /// <summary>一条错误摘要最多拼接几段「有区分度」的消息；再多对排障没有额外收益，只会撑长状态栏。</summary>
+    private const int MaxErrorChainSegments = 3;
+
+    /// <summary>错误摘要的总长上限（字符）；拼接后仍超长即截断，作为最后一道防线。</summary>
+    private const int MaxErrorReasonLength = 512;
+
+    /// <summary>
+    /// 拼接异常链各段时使用的分隔符，读作「A ← B」= A 是被 B 造成的，与异常包裹方向一致。
+    /// </summary>
+    private const string ErrorChainSeparator = " ← ";
+
     private readonly Func<string?> _accessTokenProvider;
     private readonly ReconnectPolicy _reconnectPolicy;
     private readonly ConnectionStateTracker _tracker = new();
@@ -94,10 +109,10 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
         int maxMessageBytes = DefaultMaxMessageBytes,
         Action<OneBotDiagnostic>? diagnostics = null)
     {
-        ArgumentNullException.ThrowIfNull(settings);
-        ArgumentNullException.ThrowIfNull(accessTokenProvider);
+        Guard.NotNull(settings, nameof(settings));
+        Guard.NotNull(accessTokenProvider, nameof(accessTokenProvider));
 
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(maxMessageBytes, 0, "单帧上限必须大于零。");
+        Guard.ThrowIfLessThanOrEqual(maxMessageBytes, 0, "单帧上限必须大于零。");
 
         _endpoint = BuildEndpoint(settings.Host, settings.Port, settings.UseSsl);
         _accessTokenProvider = accessTokenProvider;
@@ -140,7 +155,7 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
     public async IAsyncEnumerable<GroupMessageEvent> StreamAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
+        Guard.ThrowIfDisposed(Volatile.Read(ref _disposed), GetType().FullName);
 
         var handle = EnsureRunStarted(cancellationToken);
         var reader = handle.Channel.Reader;
@@ -232,7 +247,8 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
         }
 
         // UriBuilder 归一化默认端口：ws 默认 80、wss 默认 443，显式端口一律保留。
-        return new UriBuilder(useSsl ? Uri.UriSchemeWss : Uri.UriSchemeWs, host, port, "/").Uri;
+        // net48 没有 Uri.UriSchemeWs / Uri.UriSchemeWss（.NET Core 2.1+），写 RFC 6455 的字面量。
+        return new UriBuilder(useSsl ? "wss" : "ws", host, port, "/").Uri;
     }
 
     private bool MarkDisposed()
@@ -291,7 +307,7 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
     {
         lock (_gate)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            Guard.ThrowIfDisposed(_disposed, GetType().FullName);
 
             // 上一轮循环已结束（正常收尾或重试耗尽）时允许重新订阅。
             if (_run is null || _run.Task.IsCompleted)
@@ -414,7 +430,24 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
         }
         catch (Exception ex)
         {
-            var reason = Sanitize(ex.Message);
+            // 用户自己按下停止，不是一次连接失败，必须在记账之前挡掉。
+            //
+            // net48 上取消一个「正在进行」的 ClientWebSocket.ConnectAsync 抛的并不是
+            // OperationCanceledException（上面那个 catch 因此接不住），实测是：
+            //   WebSocketException("无法连接到远程服务器")
+            //   ← WebException("请求被中止: 请求已被取消。")  [Status = RequestCanceled]
+            // 形状和真正的握手失败一模一样，于是「我要停机」被记成一条错误，
+            // 把上一次真实失败的原因顶掉——用户停个连接就再也看不到刚才错在哪了。
+            // 连接失败与主动取消同帧发生时，以令牌为准：真正的失败早就被 RecordError 记下，
+            // 这里什么都不写也不会丢；而记一条取消噪声则一定是以假乱真。
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return new SessionResult(SessionOutcome.Cancelled, Connected: false);
+            }
+
+            // 必须走异常链而不是单取 ex.Message：net48 上握手 401 的顶层消息被 BCL 泛化成
+            // 「无法连接到远程服务器」，401 / Unauthorized 只存在于 InnerException 里。
+            var reason = BuildFailureReason(ex);
             _tracker.RecordError(reason);
 
             // 真实错误必须同时走状态事件，只 RecordError 是不够的：
@@ -515,8 +548,10 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
 
             while ((socket.State is WebSocketState.Open or WebSocketState.CloseSent) && !cancellationToken.IsCancellationRequested)
             {
+                // net48 的 ClientWebSocket.ReceiveAsync 只收 ArraySegment<byte>；
+                // 用数组分段表达同一段缓冲区，不产生拷贝。
                 var result = await socket
-                    .ReceiveAsync(buffer.AsMemory(0, ReceiveChunkSize), cancellationToken)
+                    .ReceiveAsync(new ArraySegment<byte>(buffer, 0, ReceiveChunkSize), cancellationToken)
                     .ConfigureAwait(false);
 
                 if (result.MessageType == WebSocketMessageType.Close)
@@ -577,7 +612,9 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
             // 一帧内可能有多个顶层 JSON 值（粘包），逐个解析并映射。
             foreach (var value in OneBotFrameSplitter.Split(payload))
             {
-                var result = OneBotEventParser.ParseDetailed(Encoding.UTF8.GetString(value.Span));
+                // net48 的 Encoding.GetString 只收 byte[]（ReadOnlySpan<byte> 重载是 .NET Core 2.1+）。
+                // 每个顶层 JSON 值一次拷贝：帧最大 4 MiB，且只在解码时发生一次，可接受。
+                var result = OneBotEventParser.ParseDetailed(Encoding.UTF8.GetString(value.ToArray()));
 
                 if (OneBotMapper.TryMapToGroupMessageEvent(result, out var groupMessage))
                 {
@@ -671,9 +708,92 @@ public sealed class OneBotWebSocketClient : IOneBotEventSource, IDisposable, IAs
 
         var token = _activeToken;
 
+        // net48 没有 string.Replace(string, string, StringComparison)（.NET Core 2.1+）。
+        // 两参数的 string.Replace 本来就是序数比较，语义与 StringComparison.Ordinal 完全一致。
+        // 同理 string.IsNullOrEmpty 在 net48 上没有 [NotNullWhen(false)] 标注，
+        // 编译器不会自动收窄 message / token，这里显式收一次。
         return string.IsNullOrEmpty(token)
-            ? message
-            : message.Replace(token, "***", StringComparison.Ordinal);
+            ? message!
+            : message!.Replace(token!, "***");
+    }
+
+    /// <summary>
+    /// 把异常及其 <see cref="Exception.InnerException"/> 链压成一条用户可见的失败原因。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 只取 <see cref="Exception.Message"/> 在 <c>net48</c> 上会丢掉真正的原因。实测：
+    /// 握手被 401 拒绝时异常链是 <c>WebSocketException("无法连接到远程服务器")
+    /// ← WebException("远程服务器返回错误：(401) 未经授权。")</c>——
+    /// 状态码与「未经授权」全在里层，顶层被 BCL 泛化掉了。
+    /// 用户填错令牌或填错端口时，界面上就只剩一句废话。
+    /// </para>
+    /// <para>三条约束，缺一不可：</para>
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     <strong>逐层脱敏</strong>：内层异常同样可能带 URL（含 userinfo）、<c>Bearer</c> 头或令牌明文，
+    ///     因此每一段都单独过一次 <see cref="Sanitize"/>，而不是只脱敏最外层。
+    ///   </description></item>
+    ///   <item><description>
+    ///     <strong>逐层去重</strong>：包装异常经常把内层的消息原样复述一遍
+    ///     （端口不通时 <c>WebSocketException</c> 与 <c>WebException</c> 两层都是「无法连接到远程服务器」），
+    ///     无脑拼接只会让同一句话出现两遍，并不更清楚。去重按脱敏<em>之后</em>的文本做序数比较，
+    ///     这样「仅差一个令牌」的两段也会正确折叠成一段。
+    ///   </description></item>
+    ///   <item><description>
+    ///     <strong>长度封顶</strong>：只取前 <see cref="MaxErrorChainSegments"/> 段有区分度的消息，
+    ///     遍历本身再限 <see cref="MaxErrorChainHops"/> 跳（异常链可能是 <c>AggregateException</c> 摊平的，
+    ///     也可能自引用），最后对总长兜底截断。
+    ///   </description></item>
+    /// </list>
+    /// <para>
+    /// <strong>只追加、不替换</strong>：最外层永远是第一段，因此 <c>net10</c> 上
+    /// 「顶层消息已说清状态码」的那条行为不受影响，内层只是追加的佐证；
+    /// 真正依赖内层补信息的只有 <c>net48</c>。
+    /// </para>
+    /// <para>
+    /// 方法本身是 <c>internal</c> 而非 <c>private</c>：上面三条约束没法经公开 API 构造出
+    /// 对应的异常链（真实 BCL 链最多三层、且顶层与二层常常一字不差），
+    /// 而它们恰恰是「异常链不会把状态栏撑爆」的唯一保险。
+    /// 项目已对测试程序集开放 internal，因此可以直接用合成链把这三条钉死。
+    /// </para>
+    /// </remarks>
+    /// <param name="exception">捕获到的异常。</param>
+    /// <returns>已脱敏、可直接展示的失败原因。</returns>
+    internal string BuildFailureReason(Exception exception)
+    {
+        var segments = new List<string>(MaxErrorChainSegments);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        Exception? current = exception;
+
+        for (var hops = 0;
+             current is not null && hops < MaxErrorChainHops && segments.Count < MaxErrorChainSegments;
+             hops++)
+        {
+            var message = Sanitize(current.Message).Trim();
+
+            // seen.Add 返回 true 表示「此前没见过」。重复消息直接跳过，且不占用段数预算。
+            if (message.Length > 0 && seen.Add(message))
+            {
+                segments.Add(message);
+            }
+
+            current = current.InnerException;
+        }
+
+        if (segments.Count == 0)
+        {
+            // 理论上到不了这里（BCL 异常总有非空消息）。真到了也不能给状态栏塞空串：
+            // 退回类型名，至少还看得出是哪一类错。
+            return Sanitize(exception.GetType().Name);
+        }
+
+        var reason = string.Join(ErrorChainSeparator, segments);
+
+        return reason.Length <= MaxErrorReasonLength
+            ? reason
+            : reason.Substring(0, MaxErrorReasonLength) + "…";
     }
 
     private sealed record RunHandle(

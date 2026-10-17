@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using StreamingAggregation.Core.Abstractions;
@@ -171,12 +172,19 @@ public sealed class MessagePipeline
     /// <param name="cancellationToken">取消令牌。</param>
     private async Task FlushLoopAsync(CancellationToken cancellationToken)
     {
-        using var timer = new PeriodicTimer(ComputeFlushInterval());
+        var interval = ComputeFlushInterval();
+        var stopwatch = Stopwatch.StartNew();
 
         try
         {
-            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            while (true)
             {
+                // net48 没有 PeriodicTimer（.NET Core 3.0+）。用 Stopwatch 把刻度锚定在
+                // interval 的整数倍上：催熟耗时再长也不会让节奏逐次后移（催熟本身的耗时
+                // 不该累加到下一段的等待里）。
+                var untilNextTick = interval - TimeSpan.FromTicks(stopwatch.Elapsed.Ticks % interval.Ticks);
+                await Task.Delay(untilNextTick, cancellationToken).ConfigureAwait(false);
+
                 if (_isPaused())
                 {
                     continue;

@@ -1,3 +1,4 @@
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Core.Filtering;
@@ -21,7 +22,7 @@ public sealed class IdentityFilter : IMessageFilter
     /// <inheritdoc />
     public IReadOnlyList<Message> Filter(IReadOnlyList<Message> messages)
     {
-        ArgumentNullException.ThrowIfNull(messages);
+        Guard.NotNull(messages, nameof(messages));
 
         var result = new List<Message>(messages.Count);
 

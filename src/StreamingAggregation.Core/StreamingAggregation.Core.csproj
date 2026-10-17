@@ -1,9 +1,51 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
+  <!--
+    Core：纯领域层，无 UI / 无 IO。
+    TFM = net48（阶段 1a 起从 net10.0 迁移）。
+
+    LangVersion=latest 是必需的，不是"跟随 SDK"的意思：
+      - 模型里大量用 C# 14 的 field 关键字（`get => field;`）与集合表达式
+        （[... items]），net48 的默认语言版本只有 7.3，不显式抬上去直接编译失败。
+      - 已实测：LangVersion=latest + net48 下 field 关键字可用（探针见
+        .tmp/langver-probe/），无需 LangVersion=preview。
+    net48 本身没有语言版本概念，LangVersion 是编译器行为，与 TFM 无关，
+    所以 net10 / net48 两套 TFM 共存时不会互相干扰。
+  -->
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      net48 在 Linux/macOS 上没有 GAC 里的参考程序集，靠这个包提供
+      编译期 ref 程序集。不带它，非 Windows CI 上直接 MSB3644 失败。
+      PrivateAssets=all：它只是构建期垫片，绝不能流到下游项目的依赖图里
+      （App 仍是 net10.0-windows，多余的 net48 引用反而会污染还原）。
+    -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <!--
+      PolySharp 生成编译器需要、但 net48 BCL 缺失的语言级类型：
+        System.Runtime.CompilerServices.IsExternalInit        （init / record）
+        System.Runtime.CompilerServices.RequiredMemberAttribute（required 成员）
+        System.Runtime.CompilerServices.CompilerFeatureRequiredAttribute
+        System.Index / System.Range                        （[..^1] 范围语法）
+        System.Diagnostics.CodeAnalysis.*Attribute         （NotNullWhen 等）
+        System.Runtime.CompilerServices.CollectionBuilderAttribute
+      这些都是 internal 生成到本程序集，不会与 App(net10) 冲突：
+      net10 上编译器原生就认识这些名字，PolySharp 自己会全部跳过，
+      两个 TFM 因此可以共存于同一份源码。
+    -->
+    <PackageReference Include="PolySharp" Version="1.16.0" PrivateAssets="all" />
+    <!--
+      IOneBotEventSource / IAggregationWindow 直接暴露 IAsyncEnumerable<T>，
+      而 net48 的 mscorlib 没有它（也没有 EnumeratorCancellationAttribute，
+      而后者 PolySharp 不生成 —— 只能靠这个包）。
+    -->
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="10.0.0" />
+  </ItemGroup>
 
 </Project>

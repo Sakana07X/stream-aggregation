@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using StreamingAggregation.Core.Abstractions;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Infrastructure.Persistence;
 
 namespace StreamingAggregation.Infrastructure.Security;
@@ -92,7 +93,7 @@ public sealed class DpapiSecretStore : ISecretStore
     /// <inheritdoc />
     public string? GetSecret(string key)
     {
-        ArgumentException.ThrowIfNullOrEmpty(key);
+        Guard.NotNullOrEmpty(key);
 
         string? encrypted;
         lock (_gate)
@@ -129,8 +130,8 @@ public sealed class DpapiSecretStore : ISecretStore
     /// <inheritdoc />
     public void SetSecret(string key, string value)
     {
-        ArgumentException.ThrowIfNullOrEmpty(key);
-        ArgumentNullException.ThrowIfNull(value);
+        Guard.NotNullOrEmpty(key);
+        Guard.NotNull(value);
 
         var plainBytes = Encoding.UTF8.GetBytes(value);
         var encryptedBytes = ProtectedData.Protect(
@@ -151,7 +152,7 @@ public sealed class DpapiSecretStore : ISecretStore
     /// <inheritdoc />
     public void RemoveSecret(string key)
     {
-        ArgumentException.ThrowIfNullOrEmpty(key);
+        Guard.NotNullOrEmpty(key);
 
         lock (_gate)
         {
@@ -207,11 +208,12 @@ public sealed class DpapiSecretStore : ISecretStore
 
         lock (_gate)
         {
-            foreach (var (key, value) in file.Secrets)
+            // net48 的 KeyValuePair<,> 没有 Deconstruct，隐式解构变量不可用。
+            foreach (KeyValuePair<string, string> pair in file.Secrets)
             {
-                if (!string.IsNullOrEmpty(key) && !string.IsNullOrEmpty(value))
+                if (!string.IsNullOrEmpty(pair.Key) && !string.IsNullOrEmpty(pair.Value))
                 {
-                    _store[key] = value;
+                    _store[pair.Key] = pair.Value;
                 }
             }
         }
@@ -234,7 +236,30 @@ public sealed class DpapiSecretStore : ISecretStore
         // 那等于把所有密钥一次性报废。
         var temporaryPath = _storePath + ".tmp";
         File.WriteAllText(temporaryPath, payload);
-        File.Move(temporaryPath, _storePath, overwrite: true);
+        MoveOverwrite(temporaryPath, _storePath);
+    }
+
+    /// <summary>
+    /// 覆盖式移动。net48 的 <see cref="File.Move(string, string)"/> 没有 <c>overwrite</c>
+    /// 重载（.NET Core 3.0+），这里用「目标已存在则
+    /// <see cref="File.Replace(string, string, string?)"/>、否则
+    /// <see cref="File.Move(string, string)"/>」还原覆盖语义。
+    /// </summary>
+    /// <remarks>
+    /// 特意不用「先 <c>File.Delete</c> 再 <c>File.Move</c>」：那两步之间存在一个
+    /// 目标文件不存在的窗口，进程此时被杀就等于既没有新文件也没有旧文件。
+    /// <c>File.Replace</c> 底层走 ReplaceFile（同卷内原子），保留的正是
+    /// <c>MoveFileEx(MOVEFILE_REPLACE_EXISTING)</c> 的"目标始终存在"保证。
+    /// </remarks>
+    private static void MoveOverwrite(string sourcePath, string destinationPath)
+    {
+        if (File.Exists(destinationPath))
+        {
+            File.Replace(sourcePath, destinationPath, destinationBackupFileName: null);
+            return;
+        }
+
+        File.Move(sourcePath, destinationPath);
     }
 
     /// <summary>
@@ -245,7 +270,7 @@ public sealed class DpapiSecretStore : ISecretStore
     {
         try
         {
-            File.Move(_storePath, _storePath + CorruptSuffix, overwrite: true);
+            MoveOverwrite(_storePath, _storePath + CorruptSuffix);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

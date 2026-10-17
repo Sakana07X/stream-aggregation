@@ -397,7 +397,9 @@ public sealed class OneBotAccessTokenTests
         await Task.Delay(window);
         var snapshot = client.Tracker.Snapshot();
 
-        await cts.CancelAsync();
+        // net48 没有 CancelAsync（net8+）：同步 Cancel 的效果相同，
+        // 后面照样 await consume 把消费者收干净。
+        cts.Cancel();
         await consume;
         return snapshot;
     }
@@ -417,7 +419,7 @@ public sealed class OneBotAccessTokenTests
         }
 
         var snapshot = client.Tracker.Snapshot();
-        await cts.CancelAsync();
+        cts.Cancel();
         await consume;
         return snapshot;
     }

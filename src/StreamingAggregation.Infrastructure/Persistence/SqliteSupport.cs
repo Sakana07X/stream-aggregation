@@ -89,8 +89,15 @@ internal static class QueryLimit
     /// 解释为"不限制"（传 -1 会把整张表拉进内存），而 <c>0</c> 会返回空列表——
     /// 两种都不是"给我最近几条"想要的语义。钳制让边界输入退化成"取一条"，
     /// 既不会炸内存，也不会让调用方误以为库里真的没有数据。
+    /// </summary>
+    /// <remarks>
+    /// net48 没有 <c>Math.Clamp</c>（.NET Core 2.0+），这里手写等价的三段比较：
+    /// 小于下界取下界，大于上界取上界，区间内原样返回。
     /// </remarks>
-    internal static int Clamp(int limit) => Math.Clamp(limit, Min, Max);
+    internal static int Clamp(int limit) =>
+        limit < Min ? Min
+        : limit > Max ? Max
+        : limit;
 }
 
 /// <summary>

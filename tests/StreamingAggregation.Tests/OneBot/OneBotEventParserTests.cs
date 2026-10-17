@@ -25,8 +25,9 @@ public sealed class OneBotEventParserTests
     /// <summary>Unix 时间戳 1700000000 对应的 UTC 时刻。</summary>
     private static readonly DateTime EnvelopeTime = new(2023, 11, 14, 22, 13, 20, DateTimeKind.Utc);
 
-    /// <summary>缺失或非法时间戳的占位值。</summary>
-    private static readonly DateTime Epoch = DateTime.UnixEpoch;
+    /// <summary>缺失或非法时间戳的占位值（Unix 纪元）。</summary>
+    private static readonly DateTime Epoch =
+        new(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc); // net48 没有 DateTime.UnixEpoch（netstandard2.1）
 
     private static string GroupJson(string message, string? rawMessage = null)
         => "{" + GroupEnvelope + ",\"message\":" + message

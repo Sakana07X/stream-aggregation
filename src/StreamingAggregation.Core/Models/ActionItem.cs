@@ -1,3 +1,5 @@
+using StreamingAggregation.Core.Diagnostics;
+
 namespace StreamingAggregation.Core.Models;
 
 /// <summary>
@@ -11,7 +13,7 @@ public sealed record ActionItem
         get => field;
         init
         {
-            ArgumentException.ThrowIfNullOrWhiteSpace(value, nameof(Id));
+            Guard.NotNullOrWhiteSpace(value, nameof(Id));
             field = value;
         }
     }
@@ -22,7 +24,7 @@ public sealed record ActionItem
         get => field;
         init
         {
-            ArgumentException.ThrowIfNullOrWhiteSpace(value, nameof(Action));
+            Guard.NotNullOrWhiteSpace(value, nameof(Action));
             field = value;
         }
     }
@@ -42,7 +44,7 @@ public sealed record ActionItem
         get => field;
         init
         {
-            ArgumentException.ThrowIfNullOrWhiteSpace(value, nameof(SourceGroupId));
+            Guard.NotNullOrWhiteSpace(value, nameof(SourceGroupId));
             field = value;
         }
     }

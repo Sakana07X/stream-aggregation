@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using StreamingAggregation.Core.Abstractions;
 using StreamingAggregation.Core.Configuration;
+using StreamingAggregation.Core.Diagnostics;
 
 namespace StreamingAggregation.Infrastructure.Persistence;
 
@@ -76,7 +77,7 @@ public sealed class SettingsStore : ISettingsStore
         ISecretStore? secretStore = null,
         IClock? clock = null)
     {
-        ArgumentNullException.ThrowIfNull(connectionFactory);
+        Guard.NotNull(connectionFactory);
 
         _connectionFactory = connectionFactory;
         _secretStore = secretStore;
@@ -86,11 +87,11 @@ public sealed class SettingsStore : ISettingsStore
     /// <summary>读取设置；数据库尚未初始化行时返回默认值。</summary>
     public async Task<AppSettings> LoadAsync(CancellationToken cancellationToken = default)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = SelectSql;
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             return new AppSettings();
@@ -120,7 +121,10 @@ public sealed class SettingsStore : ISettingsStore
             GroupWhitelist = new GroupWhitelist { GroupIds = ReadWhitelist(reader) },
         };
 
-        await reader.DisposeAsync().ConfigureAwait(false);
+        // 必须在读同一连接上的下一条语句之前释放 reader：SQLite 一条连接上同时只有一个
+        // 活跃语句。提前 Dispose 与 await using 析构的时机等价，而 net48 只有同步 Dispose。
+        reader.Dispose();
+
         ApplySecrets(settings);
         return settings;
     }
@@ -128,7 +132,7 @@ public sealed class SettingsStore : ISettingsStore
     /// <inheritdoc />
     public async Task SaveAsync(AppSettings settings, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(settings);
+        Guard.NotNull(settings);
         Validate(settings);
 
         var token = settings.OneBotConnection.Token ?? string.Empty;
@@ -138,8 +142,8 @@ public sealed class SettingsStore : ISettingsStore
         // 反过来一旦数据库写失败，密钥库里的新值就成了孤儿。
         StoreSecrets(token, apiKey);
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = UpsertSql;
         command
             .Bind("$one_bot_host", settings.OneBotConnection.Host ?? string.Empty)
@@ -161,8 +165,8 @@ public sealed class SettingsStore : ISettingsStore
     /// <inheritdoc />
     public async Task<bool> HasStoredSettingsAsync(CancellationToken cancellationToken = default)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = SelectExistsSql;
 
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
@@ -172,8 +176,8 @@ public sealed class SettingsStore : ISettingsStore
     /// <inheritdoc />
     public async Task MarkWelcomeDismissedAsync(CancellationToken cancellationToken = default)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = MarkWelcomeDismissedSql;
         command.Bind("$updated_at", SqliteTime.ToStorage(_clock.Now));
 
@@ -206,10 +210,10 @@ public sealed class SettingsStore : ISettingsStore
 
     private static void Validate(AppSettings settings)
     {
-        ArgumentOutOfRangeException.ThrowIfLessThan(settings.OneBotConnection.Port, 1, "OneBotConnection.Port");
-        ArgumentOutOfRangeException.ThrowIfGreaterThan(settings.OneBotConnection.Port, 65535, "OneBotConnection.Port");
-        ArgumentOutOfRangeException.ThrowIfLessThan(settings.Model.TimeoutSeconds, 1, "Model.TimeoutSeconds");
-        ArgumentOutOfRangeException.ThrowIfLessThan(settings.Aggregation.WindowMinutes, 1, "Aggregation.WindowMinutes");
-        ArgumentOutOfRangeException.ThrowIfLessThan(settings.Aggregation.RetentionDays, 1, "Aggregation.RetentionDays");
+        Guard.ThrowIfLessThan(settings.OneBotConnection.Port, 1, "OneBotConnection.Port");
+        Guard.ThrowIfGreaterThan(settings.OneBotConnection.Port, 65535, "OneBotConnection.Port");
+        Guard.ThrowIfLessThan(settings.Model.TimeoutSeconds, 1, "Model.TimeoutSeconds");
+        Guard.ThrowIfLessThan(settings.Aggregation.WindowMinutes, 1, "Aggregation.WindowMinutes");
+        Guard.ThrowIfLessThan(settings.Aggregation.RetentionDays, 1, "Aggregation.RetentionDays");
     }
 }

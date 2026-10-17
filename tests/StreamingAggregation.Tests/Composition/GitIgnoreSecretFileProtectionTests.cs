@@ -181,10 +181,10 @@ public sealed class GitIgnoreSecretFileProtectionTests : IDisposable
             StandardErrorEncoding = Encoding.UTF8,
         };
 
-        foreach (var arg in args)
-        {
-            startInfo.ArgumentList.Add(arg);
-        }
+        // net48 的 ProcessStartInfo 没有 ArgumentList（netcore2.1+），只能拼 Arguments 字符串。
+        // 本测试用到的参数全是本文件里写死的简单记号（init / -b / main / --quiet / add / -A / ls-files），
+        // 不含空格、引号或反斜杠，直接以空格连接与 ArgumentList 逐项追加完全等价。
+        startInfo.Arguments = string.Join(" ", args);
 
         // 隔离全局 git 配置与交互提示：结果只由测试仓库的 .gitignore 决定，也不会卡在凭据输入上。
         startInfo.Environment["GIT_CONFIG_GLOBAL"] = Path.Combine(_repositoryDirectory, "no-such-global-gitconfig");
@@ -209,14 +209,15 @@ public sealed class GitIgnoreSecretFileProtectionTests : IDisposable
 
         Assert.True(
             process.WaitForExit(TimeoutMilliseconds),
-            $"git {string.Join(' ', args)} 在 {_repositoryDirectory} 超时未退出。");
+            // net48 的 string.Join 首参是 string，不是 char（netstandard2.1 才有 char 重载）。
+            $"git {string.Join(" ", args)} 在 {_repositoryDirectory} 超时未退出。");
 
         var stdout = stdoutTask.GetAwaiter().GetResult();
         var stderr = stderrTask.GetAwaiter().GetResult();
 
         Assert.True(
             process.ExitCode == 0,
-            $"git {string.Join(' ', args)} 在临时仓库退出码 {process.ExitCode}。stderr：{stderr}");
+            $"git {string.Join(" ", args)} 在临时仓库退出码 {process.ExitCode}。stderr：{stderr}");
 
         return stdout;
     }
@@ -228,7 +229,13 @@ public sealed class GitIgnoreSecretFileProtectionTests : IDisposable
         var output = RunGit(args: ["ls-files"]);
 
         return output
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            // net48 既没有 Split(char, StringSplitOptions) 也没有 TrimEntries（net6+）：
+            // 先按 '\n' 切并去掉空行，再逐行 Trim。
+            // 注意 Trim 后必须再滤一次空串——"只有空白"的那一行是先被 RemoveEmptyEntries
+            // 放过去、Trim 才变空的，不滤掉就会往集合里塞一个空路径。
+            .Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(static line => line.Trim())
+            .Where(static line => line.Length > 0)
             .ToHashSet(StringComparer.Ordinal);
     }
 }

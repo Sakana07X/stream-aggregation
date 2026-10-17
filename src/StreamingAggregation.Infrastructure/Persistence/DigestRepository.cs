@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using StreamingAggregation.Core;
 using StreamingAggregation.Core.Abstractions;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Infrastructure.Persistence;
@@ -34,7 +35,7 @@ public sealed class DigestRepository : IDigestStore
     /// <param name="connectionFactory">连接工厂。</param>
     public DigestRepository(ISqliteConnectionFactory connectionFactory)
     {
-        ArgumentNullException.ThrowIfNull(connectionFactory);
+        Guard.NotNull(connectionFactory);
 
         _connectionFactory = connectionFactory;
     }
@@ -43,10 +44,10 @@ public sealed class DigestRepository : IDigestStore
     /// <exception cref="InvalidOperationException">所属批次不存在时抛出。</exception>
     public async Task SaveAsync(Digest digest, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(digest);
+        Guard.NotNull(digest);
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = UpsertSql;
         command
             .Bind("$id", digest.Id)
@@ -72,10 +73,10 @@ public sealed class DigestRepository : IDigestStore
         string batchId,
         CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(batchId, nameof(batchId));
+        Guard.NotNullOrWhiteSpace(batchId, nameof(batchId));
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT {SelectColumns}
             FROM digests
@@ -100,8 +101,8 @@ public sealed class DigestRepository : IDigestStore
         int limit,
         CancellationToken cancellationToken = default)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT {SelectColumns}
             FROM digests
@@ -130,14 +131,16 @@ public sealed class DigestRepository : IDigestStore
         int limit,
         CancellationToken cancellationToken = default)
     {
-        if (!Enum.IsDefined(category))
+        // net48 的 Enum.IsDefined 只有 (Type, object) 重载；传已装箱的枚举值，
+        // 语义与 .NET 5+ 的 Enum.IsDefined<TEnum>(TEnum) 一致。
+        if (!Enum.IsDefined(typeof(DigestCategory), category))
         {
             throw new ArgumentOutOfRangeException(
                 nameof(category), category, $"未知的摘要分类：{(int)category}。");
         }
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT {SelectColumns}
             FROM digests
@@ -157,7 +160,7 @@ public sealed class DigestRepository : IDigestStore
         CancellationToken cancellationToken)
     {
         var digests = new List<Digest>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             digests.Add(ReadDigest(reader));
@@ -179,7 +182,7 @@ public sealed class DigestRepository : IDigestStore
     private static DigestCategory ToDigestCategory(int stored)
     {
         var category = (DigestCategory)stored;
-        if (!Enum.IsDefined(category))
+        if (!Enum.IsDefined(typeof(DigestCategory), category))
         {
             throw new InvalidOperationException($"digests.category 存在非法取值：{stored}。");
         }

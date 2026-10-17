@@ -1,7 +1,7 @@
-using System.Collections.Frozen;
 using System.Globalization;
 using System.Text.Json;
 using StreamingAggregation.Core;
+using StreamingAggregation.Core.Diagnostics;
 
 namespace StreamingAggregation.Infrastructure.Llm;
 
@@ -42,7 +42,7 @@ public sealed record DigestValidationError(string Field, DigestValidationErrorKi
 {
     /// <summary>输出成单行诊断文本。</summary>
     public override string ToString()
-        => string.Create(CultureInfo.InvariantCulture, $"[{Field}] {Kind}：{Message}");
+        => string.Format(CultureInfo.InvariantCulture, $"[{Field}] {Kind}：{Message}");
 }
 
 /// <summary>
@@ -98,14 +98,14 @@ public sealed class DigestValidationResult
     /// <summary>校验通过。</summary>
     public static DigestValidationResult Success(ValidatedDigestDraft draft)
     {
-        ArgumentNullException.ThrowIfNull(draft);
+        Guard.NotNull(draft);
         return new DigestValidationResult(draft, Array.Empty<DigestValidationError>());
     }
 
     /// <summary>校验失败，至少带一条明细。</summary>
     public static DigestValidationResult Failure(IReadOnlyList<DigestValidationError> errors)
     {
-        ArgumentNullException.ThrowIfNull(errors);
+        Guard.NotNull(errors);
         if (errors.Count == 0)
         {
             throw new ArgumentException("失败结果至少要有一条错误明细。", nameof(errors));
@@ -224,7 +224,9 @@ public static class DigestSchemaValidator
             ]);
         }
 
-        if (!TryParseDocument(rawJson, out var document, out var parseError))
+        // net48 的 string.IsNullOrWhiteSpace 没有 [NotNullWhen(false)] 标注（BCL 对可空
+        // 分析是"无标注"的），编译器不会自动把 rawJson 收窄成非空，这里显式收一次。
+        if (!TryParseDocument(rawJson!, out var document, out var parseError))
         {
             return DigestValidationResult.Failure(
             [
@@ -493,7 +495,7 @@ public static class DigestSchemaValidator
 
         // 用 InvariantCulture 解析：模型给的是 ISO/公历日期，不该受本机区域设置影响。
         return DateTime.TryParseExact(
-            text.Trim(),
+            text!.Trim(),
             DeadlineFormats,
             CultureInfo.InvariantCulture,
             DeadlineStyles,
@@ -560,10 +562,23 @@ public static class DigestSchemaValidator
     private static class EnumNameMap<TEnum>
         where TEnum : struct, Enum
     {
-        internal static readonly FrozenDictionary<string, TEnum> Map =
-            Enum.GetNames<TEnum>()
-                .ToFrozenDictionary(name => name, name => Enum.Parse<TEnum>(name), StringComparer.OrdinalIgnoreCase);
+        // net48 没有 System.Collections.Frozen（.NET 8+），也没有 Enum.GetNames<TEnum>() /
+        // Enum.Parse<TEnum>()（.NET 5+）。改用 Dictionary + (Type, ...) 非泛型重载：
+        // 枚举名集合在进程生命周期内不变，构建一次即可，语义与原实现一致。
+        internal static readonly Dictionary<string, TEnum> Map = BuildMap();
 
-        internal static string Allowed { get; } = string.Join(" / ", Enum.GetNames<TEnum>());
+        internal static string Allowed { get; } = string.Join(" / ", Enum.GetNames(typeof(TEnum)));
+
+        private static Dictionary<string, TEnum> BuildMap()
+        {
+            var map = new Dictionary<string, TEnum>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (string name in Enum.GetNames(typeof(TEnum)))
+            {
+                map[name] = (TEnum)Enum.Parse(typeof(TEnum), name);
+            }
+
+            return map;
+        }
     }
 }

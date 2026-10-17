@@ -1,4 +1,5 @@
 using StreamingAggregation.Core.Abstractions;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Infrastructure.Llm;
@@ -53,7 +54,7 @@ public sealed class LlmResultMapper
     /// <param name="fallbackBuilder">回退摘要构造器；为 null 时按同一时钟新建一个。</param>
     public LlmResultMapper(IClock clock, FallbackDigestBuilder? fallbackBuilder)
     {
-        ArgumentNullException.ThrowIfNull(clock);
+        Guard.NotNull(clock);
 
         _clock = clock;
         _fallbackBuilder = fallbackBuilder ?? new FallbackDigestBuilder(clock);
@@ -67,7 +68,7 @@ public sealed class LlmResultMapper
     /// <param name="rawJson">模型原始 JSON 输出。</param>
     public DigestMapping MapOrFallback(AggregationBatch batch, string? rawJson)
     {
-        ArgumentNullException.ThrowIfNull(batch);
+        Guard.NotNull(batch);
 
         var validation = DigestSchemaValidator.Validate(rawJson);
         if (validation.IsValid)
@@ -86,9 +87,9 @@ public sealed class LlmResultMapper
     /// <param name="draft">校验通过的模型输出。</param>
     public DigestMapping Map(AggregationBatch batch, ValidatedDigestDraft draft)
     {
-        ArgumentNullException.ThrowIfNull(batch);
-        ArgumentNullException.ThrowIfNull(draft);
-        ArgumentException.ThrowIfNullOrWhiteSpace(draft.Summary, nameof(draft));
+        Guard.NotNull(batch);
+        Guard.NotNull(draft);
+        Guard.NotNullOrWhiteSpace(draft.Summary, nameof(draft));
 
         var digest = new Digest
         {

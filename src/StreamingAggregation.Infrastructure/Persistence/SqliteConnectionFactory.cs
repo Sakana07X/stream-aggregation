@@ -97,7 +97,9 @@ public sealed class SqliteConnectionFactory : ISqliteConnectionFactory
         }
         catch
         {
-            await connection.DisposeAsync().ConfigureAwait(false);
+            // net48 的 SqliteConnection 没有 DisposeAsync：Dispose() 关闭连接并把它
+            // 归还连接池（连接串里 Pooling = true），同步释放在这里完全等价。
+            connection.Dispose();
             throw;
         }
     }
@@ -136,7 +138,7 @@ public sealed class SqliteConnectionFactory : ISqliteConnectionFactory
         string pragma,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        using var command = connection.CreateCommand();
         command.CommandText = pragma;
         var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return value as string ?? value?.ToString();

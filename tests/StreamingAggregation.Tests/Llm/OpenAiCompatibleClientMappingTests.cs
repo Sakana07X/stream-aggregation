@@ -243,12 +243,14 @@ public sealed class OpenAiCompatibleClientMappingTests
     /// <remarks>
     /// 手工转义而不是用 <c>JsonSerializer</c>：测试要的是"字符串里长什么样模型就会收到什么"，
     /// 序列化器可能改换行、加转义，反而遮住真正要测的东西。
+    /// net48 没有 <c>Replace(旧, 新, StringComparison)</c>（netstandard2.1），
+    /// 双参重载本身就是 Ordinal 比较，与原写法的 <c>StringComparison.Ordinal</c> 完全一致。
     /// </remarks>
     private static string JsonEscape(string value) =>
-        "\"" + value.Replace("\\", "\\\\", StringComparison.Ordinal)
-            .Replace("\"", "\\\"", StringComparison.Ordinal)
-            .Replace("\n", "\\n", StringComparison.Ordinal)
-            .Replace("\r", string.Empty, StringComparison.Ordinal) + "\"";
+        "\"" + value.Replace("\\", "\\\\")
+            .Replace("\"", "\\\"")
+            .Replace("\n", "\\n")
+            .Replace("\r", string.Empty) + "\"";
 
     private static AggregationBatch BuildBatch(string text = "今晚八点开线上评审，别忘了提前十分钟进会议室。") => new()
     {

@@ -86,8 +86,15 @@ public sealed record OneBotParseResult
 /// </summary>
 public static class OneBotEventParser
 {
-    /// <summary>缺失或非法时间戳的占位值。</summary>
-    public static readonly DateTime MissingTimestamp = DateTime.UnixEpoch;
+    /// <summary>
+    /// 缺失或非法时间戳的占位值。
+    /// </summary>
+    /// <remarks>
+    /// net48 没有 <c>DateTime.UnixEpoch</c>（.NET Core 2.1+），这里显式构造
+    /// Unix 纪元：1970-01-01T00:00:00Z，<see cref="DateTimeKind.Utc"/> 与原值一致。
+    /// </remarks>
+    public static readonly DateTime MissingTimestamp =
+        new(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
     private static readonly JsonSerializerOptions SerializerOptions = CreateOptions();
 
@@ -110,7 +117,9 @@ public static class OneBotEventParser
         OneBotRawEvent? raw;
         try
         {
-            raw = JsonSerializer.Deserialize<OneBotRawEvent>(json, SerializerOptions);
+            // net48 的 string.IsNullOrWhiteSpace 没有 [NotNullWhen(false)] 标注（BCL 对可空
+            // 分析是"无标注"的），编译器不会自动把 json 收窄成非空，这里显式收一次。
+            raw = JsonSerializer.Deserialize<OneBotRawEvent>(json!, SerializerOptions);
         }
         catch (JsonException ex)
         {
@@ -197,7 +206,7 @@ public static class OneBotEventParser
         {
             Kind = OneBotEventKind.Other,
             SelfId = raw.SelfId ?? string.Empty,
-            Reason = $"不处理 post_type={raw.PostType.Trim()}"
+            Reason = $"不处理 post_type={raw.PostType!.Trim()}"
         };
     }
 
@@ -243,7 +252,7 @@ public static class OneBotEventParser
         // 非数组形态（messageFormat 为 string 或实现差异）直接作为单个文本片段。
         if (!string.IsNullOrEmpty(message.Text))
         {
-            segments.Add(new OneBotSegment(OneBotSegmentTypes.Text, message.Text, IsText: true));
+            segments.Add(new OneBotSegment(OneBotSegmentTypes.Text, message.Text!, IsText: true));
         }
 
         return segments;
@@ -257,15 +266,15 @@ public static class OneBotEventParser
             return null;
         }
 
-        var text = RenderSegment(type, dto.Data);
+        var text = RenderSegment(type!, dto.Data);
         if (string.IsNullOrEmpty(text))
         {
             return null;
         }
 
         return new OneBotSegment(
-            type,
-            text,
+            type!,
+            text!,
             IsText: string.Equals(type, OneBotSegmentTypes.Text, StringComparison.Ordinal));
     }
 
@@ -343,7 +352,7 @@ public static class OneBotEventParser
 
         if (!string.IsNullOrWhiteSpace(raw.RawMessage))
         {
-            return raw.RawMessage;
+            return raw.RawMessage!;
         }
 
         return raw.Message?.Text ?? string.Empty;

@@ -1,9 +1,9 @@
-using System.Buffers;
 using System.Globalization;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using StreamingAggregation.Core.Configuration;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Infrastructure.Llm;
@@ -94,7 +94,7 @@ public static class LlmRequestBuilder
     /// <exception cref="ArgumentException">端点为空、不是绝对 URI、协议不是 http(s)，或非回环地址使用了明文 HTTP。</exception>
     public static Uri BuildChatCompletionsUri(string endpoint)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(endpoint);
+        Guard.NotNullOrWhiteSpace(endpoint);
 
         var trimmed = endpoint.Trim();
         if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var baseUri))
@@ -141,7 +141,7 @@ public static class LlmRequestBuilder
     /// </summary>
     public static string DescribeEndpoint(Uri uri)
     {
-        ArgumentNullException.ThrowIfNull(uri);
+        Guard.NotNull(uri);
 
         var builder = new UriBuilder(uri.Scheme, uri.Host, uri.Port)
         {
@@ -163,7 +163,7 @@ public static class LlmRequestBuilder
     /// <returns>批次文本；没有任何可用正文时返回空串。</returns>
     public static string BuildBatchText(AggregationBatch batch, LlmPromptOptions? options = null)
     {
-        ArgumentNullException.ThrowIfNull(batch);
+        Guard.NotNull(batch);
 
         var settings = options ?? LlmPromptOptions.Default;
         var messages = batch.Messages ?? (IReadOnlyList<Message>)Array.Empty<Message>();
@@ -182,7 +182,7 @@ public static class LlmRequestBuilder
     /// </summary>
     public static bool HasSummarizableContent(AggregationBatch batch)
     {
-        ArgumentNullException.ThrowIfNull(batch);
+        Guard.NotNull(batch);
 
         var messages = batch.Messages;
         if (messages is null || messages.Count == 0)
@@ -214,12 +214,16 @@ public static class LlmRequestBuilder
         string batchText,
         LlmPromptOptions? options = null)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(model, nameof(model));
-        ArgumentNullException.ThrowIfNull(systemPrompt);
-        ArgumentNullException.ThrowIfNull(batchText);
+        Guard.NotNullOrWhiteSpace(model, nameof(model));
+        Guard.NotNull(systemPrompt);
+        Guard.NotNull(batchText);
 
         var settings = options ?? LlmPromptOptions.Default;
-        var buffer = new ArrayBufferWriter<byte>(EstimateSize(systemPrompt, batchText));
+
+        // net48 的 System.Memory 只有 internal 的 ArrayBufferWriter<T>（CS0122），改用
+        // MemoryStream 作为 Utf8JsonWriter 的落点：写出的字节与 IBufferWriter 版本完全一致，
+        // Dispose 时 writer 会把内部缓冲刷进流，最后 ToArray() 取回完整请求体。
+        using var buffer = new MemoryStream(EstimateSize(systemPrompt, batchText));
 
         using (var writer = new Utf8JsonWriter(buffer, WriterOptions))
         {
@@ -240,14 +244,14 @@ public static class LlmRequestBuilder
             writer.WriteEndObject();
         }
 
-        return buffer.WrittenSpan.ToArray();
+        return buffer.ToArray();
     }
 
     /// <summary>提示词字符数（system + user），用于 <c>llm_calls.prompt_chars</c>。</summary>
     public static int MeasurePromptChars(string systemPrompt, string batchText)
     {
-        ArgumentNullException.ThrowIfNull(systemPrompt);
-        ArgumentNullException.ThrowIfNull(batchText);
+        Guard.NotNull(systemPrompt);
+        Guard.NotNull(batchText);
 
         return systemPrompt.Length + batchText.Length;
     }
@@ -257,7 +261,7 @@ public static class LlmRequestBuilder
     /// </summary>
     public static string StripCodeFence(string content)
     {
-        ArgumentNullException.ThrowIfNull(content);
+        Guard.NotNull(content);
 
         var text = content.Trim();
         if (text.Length == 0 || text[0] != '`')
@@ -265,7 +269,8 @@ public static class LlmRequestBuilder
             return text;
         }
 
-        var firstNewLine = text.IndexOf('\n', StringComparison.Ordinal);
+        // net48 的 string.IndexOf(char) 本来就是序数比较，与 (char, StringComparison.Ordinal) 等价。
+        var firstNewLine = text.IndexOf('\n');
         if (firstNewLine < 0)
         {
             return text;
@@ -309,7 +314,7 @@ public static class LlmRequestBuilder
                 continue;
             }
 
-            var line = string.Create(
+            var line = string.Format(
                 CultureInfo.InvariantCulture,
                 $"[{FormatTimestamp(message!.Timestamp)}] {message.Sender}: {text}\n");
 

@@ -217,8 +217,164 @@ public sealed class OneBotConnectionErrorPassthroughTests
     }
 
     // ---------------------------------------------------------------------
+    // 异常链遍历：去重、封顶，且必须走到根因
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task StreamAsync_WhenPortIsClosed_ReasonReachesRootCauseWithoutRepeatingOrOverflowing()
+    {
+        var port = FindClosedPort();
+        var diagnostics = new ConcurrentQueue<OneBotDiagnostic>();
+
+        // 先用一次裸握手取得本机运行时的真实异常链，避免把 BCL 的本地化措辞写死在断言里：
+        // 中文系统上写「无法连接到远程服务器」，英文系统上换成别的字样，要求却完全一样。
+        var chain = await CaptureChainAsync(port);
+
+        await using var client = new OneBotWebSocketClient(
+            new OneBotConnectionSettings { Host = "127.0.0.1", Port = port, UseSsl = false },
+            () => HandshakeToken,
+            FastPolicy,
+            diagnostics: diagnostics.Enqueue);
+        var model = AttachStatusModel(client);
+
+        // .NET Framework 拒绝一个回环端口要等大约 2 秒才判定失败，因此必须等「真的失败过一次」，
+        // 不能像别处那样固定观察几百毫秒：那个窗口里握手还悬着，窗口一关就只会看到取消形状的异常。
+        var snapshot = await ObserveUntilAsync(
+            client,
+            () => client.Tracker.Snapshot().ReconnectCount >= 1,
+            TimeSpan.FromSeconds(20));
+
+        Assert.Equal(0, snapshot.SuccessfulConnectionCount);
+
+        var error = Assert.IsType<string>(model.LastErrorMessage);
+        Assert.False(string.IsNullOrWhiteSpace(error), "错误摘要不得为空串。");
+
+        // 前提：这个场景的链上确实存在「被原样复述」的层，去重才有意义。
+        var top = chain[0];
+        var root = chain[chain.Count - 1];
+        Assert.NotEqual(top, root);
+        Assert.True(
+            chain.Count >= 3,
+            $"端口不通的异常链应至少三层（WebSocket / Web / Socket），实际 {chain.Count} 层：{string.Join(" -> ", chain)}");
+
+        // 根因在最里层：顶层只说「连不上」，用户无从区分端口没开还是令牌不对。
+        Assert.Contains(root, error, StringComparison.Ordinal);
+
+        // 链上同一句话只该出现一次。包装异常复述内层是常态，
+        // 无脑拼接只会让状态栏更长，并不会让用户更明白。
+        foreach (var message in chain)
+        {
+            Assert.True(
+                CountOccurrences(error, message) == 1,
+                $"「{message}」在错误摘要里出现了多次，实际错误为：{error}");
+        }
+
+        // 段数与总长都要封顶，否则异常链一变长状态栏就会被撑爆。
+        Assert.True(error.Length <= 512, $"错误摘要应不超过 512 字符，实际 {error.Length}：{error}");
+        Assert.True(
+            error.Split(new[] { " ← " }, StringSplitOptions.None).Length <= 3,
+            $"错误摘要最多拼接三段，实际为：{error}");
+
+        Assert.DoesNotContain(HandshakeToken, error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StreamAsync_WhenHandshakeFails_ShutdownNoiseNeverOverwritesRealError()
+    {
+        await using var server = new TestWebSocketServer(rejectWith401: true);
+        await server.StartAsync();
+        var diagnostics = new ConcurrentQueue<OneBotDiagnostic>();
+        var transitions = new ConcurrentQueue<ConnectionStateChangedEventArgs>();
+
+        await using var client = CreateClient(server, diagnostics, () => HandshakeToken);
+        client.StateChanged += (_, e) => transitions.Enqueue(e);
+
+        // 只要真的失败过一次就收工。关闭那一刻总会还有一个握手悬在半空，
+        // net48 上取消它的异常形状和握手失败一模一样（WebSocketException
+        // 「无法连接到远程服务器」← WebException「请求被中止：请求已被取消。」），
+        // 记下来的话就把 401 顶掉了。
+        await ObserveUntilAsync(
+            client,
+            () => client.Tracker.Snapshot().ReconnectCount >= 1,
+            TimeSpan.FromSeconds(10));
+
+        Assert.False(
+            client.LastErrorMessage?.Contains("请求被中止", StringComparison.Ordinal) ?? false,
+            $"停机噪声被当成了连接错误：{client.LastErrorMessage}");
+        Assert.False(
+            client.LastErrorMessage?.Contains("已取消", StringComparison.Ordinal) ?? false,
+            $"停机噪声被当成了连接错误：{client.LastErrorMessage}");
+
+        // 真正的原因必须还在。
+        var lastError = Assert.IsType<string>(client.LastErrorMessage);
+        Assert.True(
+            lastError.Contains("401", StringComparison.Ordinal) ||
+            lastError.Contains("Unauthorized", StringComparison.OrdinalIgnoreCase),
+            $"401 握手的错误摘要应指向状态码或未授权，实际为：{lastError}");
+    }
+
+    // ---------------------------------------------------------------------
     // 测试脚手架
     // ---------------------------------------------------------------------
+
+    /// <summary>取一个当前没有监听者的回环端口；先绑定再释放，拿到的是内核分配过的端口。</summary>
+    private static int FindClosedPort()
+    {
+        var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        listener.Start();
+
+        try
+        {
+            return ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    /// <summary>对同一个关闭端口做一次裸握手，逐层取下异常消息，得到本机运行时的真实异常链。</summary>
+    private static async Task<IReadOnlyList<string>> CaptureChainAsync(int port)
+    {
+        using var socket = new System.Net.WebSockets.ClientWebSocket();
+
+        try
+        {
+            await socket.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/"), CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            var chain = new List<string>();
+            for (var current = ex; current is not null && chain.Count < 8; current = current.InnerException)
+            {
+                chain.Add(current.Message);
+            }
+
+            return chain;
+        }
+
+        throw new InvalidOperationException("关闭端口上的裸握手居然成功了，前提不成立。");
+    }
+
+    /// <summary>统计子串出现次数；<see cref="string.Split(string[], StringSplitOptions)"/> 在 net48 上没有单参数重载。</summary>
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        if (string.IsNullOrEmpty(needle))
+        {
+            return 0;
+        }
+
+        var count = 0;
+        var index = 0;
+
+        while ((index = haystack.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += needle.Length;
+        }
+
+        return count;
+    }
 
     /// <summary>令牌委托抛异常，模拟密钥库读不到令牌。</summary>
     private static string? ThrowingTokenProvider() =>
@@ -254,7 +410,9 @@ public sealed class OneBotConnectionErrorPassthroughTests
         await Task.Delay(window);
         var snapshot = client.Tracker.Snapshot();
 
-        await cts.CancelAsync();
+        // net48 没有 CancelAsync（net8+）：同步 Cancel 的效果相同，
+        // 后面照样 await consume 把消费者收干净。
+        cts.Cancel();
         await consume;
         return snapshot;
     }
@@ -274,7 +432,7 @@ public sealed class OneBotConnectionErrorPassthroughTests
         }
 
         var snapshot = client.Tracker.Snapshot();
-        await cts.CancelAsync();
+        cts.Cancel();
         await consume;
         return snapshot;
     }

@@ -206,6 +206,24 @@ public sealed class DpapiSecretStoreTests : IDisposable
 
         Assert.Equal(SecretFileName, Path.GetFileName(path));
         Assert.Equal("流式聚合", Path.GetFileName(Path.GetDirectoryName(path)));
-        Assert.True(Path.IsPathFullyQualified(path), $"默认路径应为绝对路径，实际为 {path}。");
+        Assert.True(IsFullyQualifiedPath(path), $"默认路径应为绝对路径，实际为 {path}。");
     }
+
+    /// <summary>
+    /// net48 没有 <c>Path.IsPathFullyQualified</c>（netcore2.1+），这里补一个等价实现。
+    /// </summary>
+    /// <remarks>
+    /// 两者的差别只在「已定根」这一档：<c>C:\a</c> 两者都真，但 <c>C:a</c>（驱动器相对路径）
+    /// <c>IsPathRooted</c> 会给 true、<c>IsPathFullyQualified</c> 给 false，
+    /// 所以这里在 <c>IsPathRooted</c> 之上把驱动器相对路径单独排除掉。
+    /// </remarks>
+    private static bool IsFullyQualifiedPath(string path) =>
+        Path.IsPathRooted(path) && !IsDriveRelative(path);
+
+    /// <summary>形如 <c>C:</c> 或 <c>C:a</c>：有盘符但没有根分隔符。</summary>
+    private static bool IsDriveRelative(string path) =>
+        path.Length >= 2
+        && char.IsLetter(path[0])
+        && path[1] == ':'
+        && (path.Length == 2 || (path[2] != '\\' && path[2] != '/'));
 }

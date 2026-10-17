@@ -51,7 +51,12 @@ public sealed class DuplicateMessageFilter : IMessageFilter
 
     private static string Normalize(string text)
     {
-        // 去除首尾空白并压缩连续空白，避免格式差异导致漏判
-        return string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        // 去除首尾空白并压缩连续空白，避免格式差异导致漏判。
+        // net48 的 string.Split(char[], StringSplitOptions) 不含 TrimEntries（.NET 5+），
+        // 因此按空白切分后手动 Trim 并丢弃空段，补回 TrimEntries 的语义。
+        return string.Join(" ", text
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+            .Select(part => part.Trim())
+            .Where(part => part.Length > 0));
     }
 }

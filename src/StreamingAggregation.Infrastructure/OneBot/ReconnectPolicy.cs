@@ -1,4 +1,5 @@
 using System.Globalization;
+using StreamingAggregation.Core.Diagnostics;
 
 namespace StreamingAggregation.Infrastructure.OneBot;
 
@@ -19,6 +20,13 @@ public sealed class ReconnectPolicy
     private readonly object _randomGate = new();
 
     /// <summary>
+    /// 进程内共享的默认随机源。net48 没有 <c>Random.Shared</c>（.NET 6+），
+    /// 用一份静态实例顶上：<see cref="Random"/> 在 net48 上不是线程安全的，
+    /// 而所有读取都在 <see cref="_randomGate"/> 保护下进行，因此共享是安全的。
+    /// </summary>
+    private static readonly Random SharedRandom = new();
+
+    /// <summary>
     /// 初始化退避策略。
     /// </summary>
     /// <param name="initialDelay">首次失败后的基准等待时间，默认 1 秒。</param>
@@ -26,7 +34,7 @@ public sealed class ReconnectPolicy
     /// <param name="multiplier">每次失败后延迟的放大倍数，须 ≥ 1，默认 2。</param>
     /// <param name="jitterFactor">抖动比例，取值区间 [0, 1]，表示 ±20% 即 0.2。</param>
     /// <param name="maxAttempts">最大连续失败次数；0 表示无限重试。</param>
-    /// <param name="random">抖动随机源，测试可注入固定种子；默认使用 <see cref="Random.Shared"/>。</param>
+    /// <param name="random">抖动随机源，测试可注入固定种子；不传时用进程内共享的 <see cref="Random"/> 实例。</param>
     /// <exception cref="ArgumentOutOfRangeException">参数越界。</exception>
     public ReconnectPolicy(
         TimeSpan? initialDelay = null,
@@ -62,9 +70,9 @@ public sealed class ReconnectPolicy
             throw new ArgumentOutOfRangeException(nameof(jitterFactor), jitterFactor, "抖动比例必须位于 [0, 1] 区间。");
         }
 
-        ArgumentOutOfRangeException.ThrowIfNegative(maxAttempts);
+        Guard.ThrowIfNegative(maxAttempts);
 
-        _random = random ?? Random.Shared;
+        _random = random ?? SharedRandom;
     }
 
     /// <summary>首次失败后的基准等待时间。</summary>
@@ -90,7 +98,7 @@ public sealed class ReconnectPolicy
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="consecutiveFailures"/> 为负数。</exception>
     public TimeSpan GetDelay(int consecutiveFailures)
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(consecutiveFailures);
+        Guard.ThrowIfNegative(consecutiveFailures);
         return ApplyJitter(CalculateBaseDelay(consecutiveFailures));
     }
 
@@ -101,7 +109,7 @@ public sealed class ReconnectPolicy
     /// <returns>介于 <see cref="InitialDelay"/> 与 <see cref="MaximumDelay"/> 之间的延迟。</returns>
     public TimeSpan CalculateBaseDelay(int consecutiveFailures)
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(consecutiveFailures);
+        Guard.ThrowIfNegative(consecutiveFailures);
 
         var cap = MaximumDelay.TotalMilliseconds;
         var delay = InitialDelay.TotalMilliseconds;
@@ -136,7 +144,12 @@ public sealed class ReconnectPolicy
 
         var factor = (1.0 - JitterFactor) + (2.0 * JitterFactor * uniform);
         var jittered = baseDelay.TotalMilliseconds * factor;
-        var clamped = Math.Clamp(jittered, 0.0, MaximumDelay.TotalMilliseconds);
+
+        // net48 没有 Math.Clamp（.NET Core 2.0+），手写等价的三段比较。
+        var cap = MaximumDelay.TotalMilliseconds;
+        var clamped = jittered < 0.0 ? 0.0
+            : jittered > cap ? cap
+            : jittered;
 
         return TimeSpan.FromMilliseconds(clamped);
     }
@@ -148,12 +161,12 @@ public sealed class ReconnectPolicy
     /// <returns>允许重试返回 <see langword="true"/>。</returns>
     public bool ShouldRetry(int consecutiveFailures)
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(consecutiveFailures);
+        Guard.ThrowIfNegative(consecutiveFailures);
         return MaxAttempts == 0 || consecutiveFailures < MaxAttempts;
     }
 
     /// <inheritdoc />
-    public override string ToString() => string.Create(
+    public override string ToString() => string.Format(
         CultureInfo.InvariantCulture,
         $"ReconnectPolicy(初始 {InitialDelay.TotalMilliseconds:F0}ms × {Multiplier:F1}, 上限 {MaximumDelay.TotalMilliseconds:F0}ms, 抖动 ±{JitterFactor:P0}, 最大尝试 {(MaxAttempts == 0 ? "无限" : MaxAttempts.ToString(CultureInfo.InvariantCulture))})");
 }

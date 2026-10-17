@@ -161,7 +161,9 @@ public sealed class DigestSchemaValidatorTests
     [Fact]
     public void Validate_AcceptsFieldNamesCaseInsensitively()
     {
-        var payload = Json().Replace("\"category\"", "\"Category\"", StringComparison.Ordinal);
+        // net48 没有 Replace(旧, 新, StringComparison)（netstandard2.1）；
+        // 双参重载本身就是 Ordinal 比较，与这里传的值一致。
+        var payload = Json().Replace("\"category\"", "\"Category\"");
 
         var result = DigestSchemaValidator.Validate(payload);
 

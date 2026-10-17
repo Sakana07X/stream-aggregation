@@ -159,7 +159,9 @@ public sealed class BatchProcessorTests
     public async Task ProcessAsync_Cancellation_PropagatesAndStopsProcessing()
     {
         using var cancellation = new CancellationTokenSource();
-        await cancellation.CancelAsync();
+        // net48 没有 CancellationTokenSource.CancelAsync（net8+）：同步 Cancel 效果相同，
+        // 这里没有注册需要异步执行的回调。
+        cancellation.Cancel();
 
         var doubles = new Doubles();
 

@@ -1,3 +1,5 @@
+using StreamingAggregation.Core.Diagnostics;
+
 namespace StreamingAggregation.Core.Aggregation;
 
 /// <summary>
@@ -31,8 +33,8 @@ public sealed record AggregationOptions
         get => field;
         init
         {
-            ArgumentOutOfRangeException.ThrowIfLessThan(value, MinWindowMinutes);
-            ArgumentOutOfRangeException.ThrowIfGreaterThan(value, MaxWindowMinutes);
+            Guard.ThrowIfLessThan(value, MinWindowMinutes);
+            Guard.ThrowIfGreaterThan(value, MaxWindowMinutes);
             field = value;
         }
     } = DefaultWindowMinutes;
@@ -48,8 +50,8 @@ public sealed record AggregationOptions
         get => field;
         init
         {
-            ArgumentOutOfRangeException.ThrowIfLessThan(value, MinMessagesPerWindow);
-            ArgumentOutOfRangeException.ThrowIfGreaterThan(value, MaxMessagesPerWindowLimit);
+            Guard.ThrowIfLessThan(value, MinMessagesPerWindow);
+            Guard.ThrowIfGreaterThan(value, MaxMessagesPerWindowLimit);
             field = value;
         }
     } = DefaultMaxMessagesPerWindow;

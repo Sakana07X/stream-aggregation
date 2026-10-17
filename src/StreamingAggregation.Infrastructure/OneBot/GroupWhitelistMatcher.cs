@@ -1,4 +1,3 @@
-using System.Collections.Frozen;
 using StreamingAggregation.Core.Configuration;
 
 namespace StreamingAggregation.Infrastructure.OneBot;
@@ -15,17 +14,20 @@ public sealed class GroupWhitelistMatcher
     /// <summary>空白名单实例，恒不匹配。</summary>
     public static readonly GroupWhitelistMatcher Empty = new(Array.Empty<string>());
 
-    private readonly FrozenSet<string> _groupIds;
+    // net48 没有 System.Collections.Frozen（.NET 8+）。白名单在设置变更时才重建、
+    // 之后只读，用 HashSet 承载与 FrozenSet 的查询语义一致。
+    private readonly HashSet<string> _groupIds;
 
     /// <summary>
     /// 用群 ID 列表构造。空白项会被剔除，前后空白会被裁剪，重复项自动合并。
     /// </summary>
     public GroupWhitelistMatcher(IEnumerable<string>? groupIds)
     {
-        _groupIds = (groupIds ?? Array.Empty<string>())
-            .Where(static id => !string.IsNullOrWhiteSpace(id))
-            .Select(static id => id.Trim())
-            .ToFrozenSet(StringComparer.Ordinal);
+        _groupIds = new HashSet<string>(
+            (groupIds ?? Array.Empty<string>())
+                .Where(static id => !string.IsNullOrWhiteSpace(id))
+                .Select(static id => id.Trim()),
+            StringComparer.Ordinal);
     }
 
     /// <summary>生效的群 ID 集合。</summary>
@@ -39,6 +41,10 @@ public sealed class GroupWhitelistMatcher
         => settings is null ? Empty : new GroupWhitelistMatcher(settings.GroupIds);
 
     /// <summary>判断群 ID 是否在白名单内。</summary>
+    /// <remarks>
+    /// net48 的 string.IsNullOrWhiteSpace 没有 [NotNullWhen(false)] 标注（BCL 对可空分析
+    /// 是"无标注"的），编译器不会自动把 groupId 收窄成非空，这里显式收一次。
+    /// </remarks>
     public bool Matches(string? groupId)
-        => !string.IsNullOrWhiteSpace(groupId) && _groupIds.Contains(groupId.Trim());
+        => !string.IsNullOrWhiteSpace(groupId) && _groupIds.Contains(groupId!.Trim());
 }

@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using StreamingAggregation.Core;
 using StreamingAggregation.Core.Abstractions;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Infrastructure.Persistence;
@@ -74,7 +75,7 @@ public sealed class TaskRepository : ITaskStore
     /// <param name="clock">时间源；不传时使用 UTC 系统时钟，测试请注入假时钟。</param>
     public TaskRepository(ISqliteConnectionFactory connectionFactory, IClock? clock = null)
     {
-        ArgumentNullException.ThrowIfNull(connectionFactory);
+        Guard.NotNull(connectionFactory);
 
         _connectionFactory = connectionFactory;
         _clock = clock ?? SystemClock.Instance;
@@ -91,13 +92,13 @@ public sealed class TaskRepository : ITaskStore
     /// </remarks>
     public async Task SaveAsync(ActionItem item, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(item);
+        Guard.NotNull(item);
         Validate(item);
 
         var now = SqliteTime.ToStorage(_clock.Now);
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = UpsertSql;
         BindUpsert(command, item, now);
 
@@ -113,7 +114,7 @@ public sealed class TaskRepository : ITaskStore
     /// 升级到写锁时可能撞上的 <c>SQLITE_BUSY</c>；整批只有几十条，写锁持有时间可以接受。
     /// </para>
     /// <para>
-    /// 回滚显式执行，不依赖 <c>await using</c> 析构时的隐式行为——那个行为在不同
+    /// 回滚显式执行，不依赖 <c>using</c> 析构时的隐式行为——那个行为在不同
     /// Microsoft.Data.Sqlite 版本里并不一致，靠它兜底等于把"没写进去"的风险留给运气。
     /// 回滚本身失败（连接已断、事务已结束）时吞掉，让原始异常冒出去：那才是真正的诊断线索。
     /// </para>
@@ -122,7 +123,7 @@ public sealed class TaskRepository : ITaskStore
         IReadOnlyList<ActionItem> items,
         CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(items);
+        Guard.NotNull(items);
 
         if (items.Count == 0)
         {
@@ -133,20 +134,20 @@ public sealed class TaskRepository : ITaskStore
         // 失败语义最干净。
         foreach (var item in items)
         {
-            ArgumentNullException.ThrowIfNull(item);
+            Guard.NotNull(item);
             Validate(item);
         }
 
         var now = SqliteTime.ToStorage(_clock.Now);
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var transaction = connection.BeginTransaction(deferred: false);
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var transaction = connection.BeginTransaction(deferred: false);
 
         try
         {
             foreach (var item in items)
             {
-                await using var command = connection.CreateCommand();
+                using var command = connection.CreateCommand();
                 command.Transaction = transaction;
                 command.CommandText = UpsertSql;
                 BindUpsert(command, item, now);
@@ -154,11 +155,12 @@ public sealed class TaskRepository : ITaskStore
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            // net48 的 SqliteTransaction 没有 CommitAsync：提交本身是同步的。
+            transaction.Commit();
         }
         catch
         {
-            await TryRollbackAsync(transaction).ConfigureAwait(false);
+            TryRollback(transaction);
             throw;
         }
     }
@@ -166,14 +168,14 @@ public sealed class TaskRepository : ITaskStore
     /// <inheritdoc />
     public async Task<ActionItem?> GetByIdAsync(string id, CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(id, nameof(id));
+        Guard.NotNullOrWhiteSpace(id, nameof(id));
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = $"SELECT {SelectColumns} FROM tasks WHERE id = $id;";
         command.Bind("$id", id);
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
             ? ReadTask(reader)
             : null;
@@ -189,8 +191,8 @@ public sealed class TaskRepository : ITaskStore
     /// </remarks>
     public async Task<IReadOnlyList<ActionItem>> GetPendingAsync(CancellationToken cancellationToken = default)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT {SelectColumns}
             FROM tasks
@@ -199,7 +201,7 @@ public sealed class TaskRepository : ITaskStore
             """;
 
         var items = new List<ActionItem>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             items.Add(ReadTask(reader));
@@ -214,7 +216,7 @@ public sealed class TaskRepository : ITaskStore
         bool completed,
         CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(id, nameof(id));
+        Guard.NotNullOrWhiteSpace(id, nameof(id));
 
         await UpdateStatusAsync(id, SetCompletedSql, "$completed", completed, cancellationToken)
             .ConfigureAwait(false);
@@ -226,7 +228,7 @@ public sealed class TaskRepository : ITaskStore
         bool ignored,
         CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(id, nameof(id));
+        Guard.NotNullOrWhiteSpace(id, nameof(id));
 
         await UpdateStatusAsync(id, SetIgnoredSql, "$ignored", ignored, cancellationToken)
             .ConfigureAwait(false);
@@ -235,10 +237,10 @@ public sealed class TaskRepository : ITaskStore
     /// <inheritdoc />
     public async Task DeleteAsync(string id, CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(id, nameof(id));
+        Guard.NotNullOrWhiteSpace(id, nameof(id));
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = DeleteSql;
         command.Bind("$id", id);
 
@@ -263,12 +265,16 @@ public sealed class TaskRepository : ITaskStore
     /// 回滚尽力而为：事务可能已经提交、也可能连接已经断了，此时回滚本身会抛异常，
     /// 那时应当让调用方看到原始的写入失败，而不是清理阶段的次生异常。
     /// </summary>
-    private static async Task TryRollbackAsync(SqliteTransaction transaction)
+    /// <remarks>
+    /// net48 的 <see cref="SqliteTransaction.Rollback()"/> 是同步的（sqlite3_exec），
+    /// 没有 <c>RollbackAsync</c>，因此这里也不再需要"绕开调用方取消令牌"的处理：
+    /// 同步回滚本来就不接受令牌。
+    /// </remarks>
+    private static void TryRollback(SqliteTransaction transaction)
     {
         try
         {
-            // 不能用调用方的令牌：这里正是令牌已取消时最需要回滚的场合。
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            transaction.Rollback();
         }
         catch (Exception)
         {
@@ -279,8 +285,8 @@ public sealed class TaskRepository : ITaskStore
     /// <summary>写入前的必填字段校验，单条与整批路径共用。</summary>
     private static void Validate(ActionItem item)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(item.Id, nameof(item.Id));
-        ArgumentException.ThrowIfNullOrWhiteSpace(item.Action, nameof(item.Action));
+        Guard.NotNullOrWhiteSpace(item.Id, nameof(item.Id));
+        Guard.NotNullOrWhiteSpace(item.Action, nameof(item.Action));
     }
 
     /// <summary>
@@ -294,8 +300,8 @@ public sealed class TaskRepository : ITaskStore
         bool value,
         CancellationToken cancellationToken)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = sql;
         command
             .Bind("$id", id)
@@ -333,6 +339,7 @@ public sealed class TaskRepository : ITaskStore
         var importance = (Importance)stored;
 
         // 数据库可能被外部改坏：降级而不是抛异常，别让一行脏数据把整个待办列表读崩。
-        return Enum.IsDefined(importance) ? importance : FallbackImportance;
+        // net48 的 Enum.IsDefined 只有 (Type, object) 重载。
+        return Enum.IsDefined(typeof(Importance), importance) ? importance : FallbackImportance;
     }
 }

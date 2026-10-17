@@ -108,10 +108,12 @@ public sealed class CoreInterfaceCoverageTests
 
         var coreInterfaces = CoreInterfaceCatalog.Enumerate().ToHashSet();
 
-        foreach (var (service, provider) in AppLayerProviders)
+        // net48 的 KeyValuePair<K, V> 没有 Deconstruct 方法（netstandard2.1 才有），
+        // 改成显式取 Key / Value，断言语义不变。
+        foreach (var entry in AppLayerProviders)
         {
-            Assert.Contains(service, coreInterfaces);
-            AssertAppLayerProvider(service, provider.Implementation, provider.SourceRelativePath);
+            Assert.Contains(entry.Key, coreInterfaces);
+            AssertAppLayerProvider(entry.Key, entry.Value.Implementation, entry.Value.SourceRelativePath);
         }
     }
 

@@ -1,3 +1,5 @@
+using StreamingAggregation.Core.Diagnostics;
+
 namespace StreamingAggregation.Core.Aggregation;
 
 /// <summary>
@@ -14,7 +16,7 @@ public sealed record AggregationWindowStats
         get => field;
         init
         {
-            ArgumentException.ThrowIfNullOrWhiteSpace(value, nameof(GroupId));
+            Guard.NotNullOrWhiteSpace(value, nameof(GroupId));
             field = value;
         }
     }

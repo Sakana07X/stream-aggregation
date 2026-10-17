@@ -1,3 +1,5 @@
+using StreamingAggregation.Core.Diagnostics;
+
 namespace StreamingAggregation.Core.Models;
 
 /// <summary>
@@ -11,7 +13,7 @@ public sealed record GroupInfo
         get => field;
         init
         {
-            ArgumentException.ThrowIfNullOrWhiteSpace(value, nameof(GroupId));
+            Guard.NotNullOrWhiteSpace(value, nameof(GroupId));
             field = value;
         }
     }

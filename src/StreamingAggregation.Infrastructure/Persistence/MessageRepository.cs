@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using StreamingAggregation.Core.Abstractions;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Infrastructure.Persistence;
@@ -32,7 +33,7 @@ public sealed class MessageRepository : IMessageStore
     /// <param name="clock">时间源；不传时使用 UTC 系统时钟，测试请注入假时钟。</param>
     public MessageRepository(ISqliteConnectionFactory connectionFactory, IClock? clock = null)
     {
-        ArgumentNullException.ThrowIfNull(connectionFactory);
+        Guard.NotNull(connectionFactory);
 
         _connectionFactory = connectionFactory;
         _clock = clock ?? SystemClock.Instance;
@@ -43,11 +44,11 @@ public sealed class MessageRepository : IMessageStore
     /// </summary>
     public async Task SaveAsync(Message message, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(message);
-        ArgumentException.ThrowIfNullOrWhiteSpace(message.MessageId, nameof(message.MessageId));
+        Guard.NotNull(message);
+        Guard.NotNullOrWhiteSpace(message.MessageId, nameof(message.MessageId));
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = UpsertSql;
         command
             .Bind("$message_id", message.MessageId)
@@ -62,14 +63,14 @@ public sealed class MessageRepository : IMessageStore
     /// <inheritdoc />
     public async Task<Message?> GetByIdAsync(string id, CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(id, nameof(id));
+        Guard.NotNullOrWhiteSpace(id, nameof(id));
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = $"SELECT {SelectColumns} FROM messages WHERE message_id = $message_id;";
         command.Bind("$message_id", id);
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
             ? ReadMessage(reader)
             : null;
@@ -81,10 +82,10 @@ public sealed class MessageRepository : IMessageStore
         DateTime since,
         CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(groupId, nameof(groupId));
+        Guard.NotNullOrWhiteSpace(groupId, nameof(groupId));
 
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT {SelectColumns}
             FROM messages
@@ -111,8 +112,8 @@ public sealed class MessageRepository : IMessageStore
         int limit,
         CancellationToken cancellationToken = default)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT {SelectColumns}
             FROM messages
@@ -127,7 +128,7 @@ public sealed class MessageRepository : IMessageStore
     /// <summary>按保留期删除过期消息（保留期为负数或零时直接返回，不做删除）。</summary>
     public Task CleanupAsync(TimeSpan retention, CancellationToken cancellationToken = default)
     {
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(retention, TimeSpan.Zero, nameof(retention));
+        Guard.ThrowIfLessThanOrEqual(retention, TimeSpan.Zero, nameof(retention));
 
         return DeleteOlderThanAsync(_clock.Now - retention, cancellationToken);
     }
@@ -135,8 +136,8 @@ public sealed class MessageRepository : IMessageStore
     /// <summary>删除时间戳早于给定时刻（UTC）的消息，返回删除行数。</summary>
     public async Task<int> DeleteOlderThanAsync(DateTime cutoffUtc, CancellationToken cancellationToken = default)
     {
-        await using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
+        using var connection = await _connectionFactory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        using var command = connection.CreateCommand();
         command.CommandText = "DELETE FROM messages WHERE timestamp < $cutoff;";
         command.Bind("$cutoff", SqliteTime.ToStorage(cutoffUtc));
 
@@ -157,7 +158,7 @@ public sealed class MessageRepository : IMessageStore
         CancellationToken cancellationToken)
     {
         var messages = new List<Message>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             messages.Add(ReadMessage(reader));

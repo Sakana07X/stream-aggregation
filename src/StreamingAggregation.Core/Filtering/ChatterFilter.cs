@@ -43,7 +43,12 @@ public sealed class ChatterFilter : IMessageFilter
     {
         foreach (var keyword in _options.HighSignalKeywords)
         {
-            if (text.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+            // net48 的 string.Contains 没有 (string, StringComparison) 重载（.NET Core 2.1+），
+            // 用 IndexOf(..., StringComparison) >= 0 替代：net48 有这个重载，且
+            // Contains(value, comparison) 在新框架上本身就是 IndexOf(value, comparison) != -1。
+            // 补 keyword 的 null 判断是因为 IndexOf 对 null 抛异常，而 Contains 判 false。
+            if (keyword is not null
+                && text.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
                 return true;
         }
         return false;

@@ -1,6 +1,7 @@
 using System.Globalization;
 using StreamingAggregation.Core;
 using StreamingAggregation.Core.Abstractions;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Infrastructure.Aggregation;
@@ -65,11 +66,11 @@ public sealed class BatchProcessor
         INotificationService notifications,
         Action<PipelineLogLevel, string>? log = null)
     {
-        ArgumentNullException.ThrowIfNull(batchStore);
-        ArgumentNullException.ThrowIfNull(digestStore);
-        ArgumentNullException.ThrowIfNull(taskStore);
-        ArgumentNullException.ThrowIfNull(summarizer);
-        ArgumentNullException.ThrowIfNull(notifications);
+        Guard.NotNull(batchStore);
+        Guard.NotNull(digestStore);
+        Guard.NotNull(taskStore);
+        Guard.NotNull(summarizer);
+        Guard.NotNull(notifications);
 
         _batchStore = batchStore;
         _digestStore = digestStore;
@@ -91,7 +92,7 @@ public sealed class BatchProcessor
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task ProcessAsync(AggregationBatch batch, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(batch);
+        Guard.NotNull(batch);
 
         await _batchStore
             .SaveAsync(batch with { Status = BatchStatus.Processing }, cancellationToken)
@@ -265,7 +266,7 @@ public sealed class BatchProcessor
         var listed = actionItems.Take(MaxLoggedItemIds).Select(static item => item.Id);
         var overflow = actionItems.Count > MaxLoggedItemIds ? $" 等共 {actionItems.Count} 条" : string.Empty;
 
-        return string.Join('、', listed) + overflow;
+        return string.Join("、", listed) + overflow;
     }
 
     /// <summary>把失败描述压成一行，避免整段响应刷屏。</summary>
@@ -278,10 +279,18 @@ public sealed class BatchProcessor
             return "模型未返回可用结果。";
         }
 
-        var collapsed = string.Join(' ', rawResponse.Split(
-            ['\r', '\n'],
-            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        // net48 的 string.IsNullOrWhiteSpace 没有 [NotNullWhen(false)] 标注（BCL 对可空分析
+        // 是"无标注"的），编译器不会自动把 rawResponse 收窄成非空，这里显式收一次。
+        var text = rawResponse!;
 
-        return collapsed.Length <= MaxFailureLength ? collapsed : string.Concat(collapsed.AsSpan(0, MaxFailureLength), "…");
+        // StringSplitOptions.TrimEntries 是 .NET 5+；先按 \r / \n 切、逐段 Trim、再丢掉空段，
+        // 与「切分时同时 Trim 并去空」得到的结果完全一致。
+        var collapsed = string.Join(
+            " ",
+            text.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+                .Select(static line => line.Trim())
+                .Where(static line => line.Length > 0));
+
+        return collapsed.Length <= MaxFailureLength ? collapsed : collapsed[..MaxFailureLength] + "…";
     }
 }

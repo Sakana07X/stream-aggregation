@@ -1,10 +1,39 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>StreamingAggregation.Infrastructure</RootNamespace>
+    <!--
+      PlatformTarget=x64 与 RuntimeIdentifier=win-x64 【两个都必须写】，缺一不可。
+
+      根因：SQLite 3.53.4 的 buildTransitive/net471/SQLite.props 里是
+          Condition="'$(RuntimeIdentifier)' == '' AND $(Platform.Replace(' ','').ToLower()) == 'anycpu'"
+      两个条件都要躲开：
+        - PlatformTarget=x64 只改 $(PlatformTarget)，【不改】$(Platform)；
+          dotnet build 时 $(Platform) 仍然是 AnyCPU（$(Platform) 是解决方案级别的
+          平台矩阵属性，$(PlatformTarget) 才是"这份程序集的机器类型"）。
+        - SDK 的 "由 PlatformTarget 推导 RuntimeIdentifier" 只对【可执行项目】
+          生效（为了生成 apphost）。本项目是类库，因此推导不会发生，
+          $(RuntimeIdentifier) 保持为空 —— 探针工程是 WinExe 所以侥幸通过，
+          照抄到类库上就会踩坑。
+      于是这里显式给 win-x64。SQLite.targets 也只在 PlatformTarget ∈
+      {x86,x64,arm64} 时才复制原生 e_sqlite3.dll，两者齐备才能确保
+      runtimes/win-x64/native/e_sqlite3.dll 落进输出目录。
+      失败模式是静默的：少一个就是"编译通过、运行期 SQLitePCL 找不到原生库"。
+      详见 .tmp/net48-probe/REPORT.md「PlatformTarget=x64 是强制的」。
+    -->
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+    <!--
+      NU1701/NU1702：netstandard2.0 资产被用在 net48 上（按 net48 兼容面解析），
+      属于预期内行为，不是错误。探针已确认这些包在 net48 上功能完整。
+    -->
+    <NoWarn>$(NoWarn);NU1701;NU1702</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -15,6 +44,40 @@
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.13" />
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.5" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
+    <!--
+      net48 没有这两个类型，必须显式补。两者在 net10 上会退化为
+      「包里资产被 SDK 忽略/转发到共享框架」，与 App(net10) 共存无冲突。
+    -->
+    <PackageReference Include="System.Threading.Channels" Version="10.0.0" />
+    <PackageReference Include="System.Text.Json" Version="10.0.0" />
+    <!-- IAsyncEnumerable / IAsyncDisposable / EnumeratorCancellationAttribute 在 net48 上不存在 -->
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="PolySharp" Version="1.16.0" PrivateAssets="all" />
+    <!-- 与 Core 复用同一份 System.Threading.Lock 垫片源文件（链接而非拷贝，避免三处漂移）。 -->
+    <Compile Include="..\StreamingAggregation.Core\Compatibility\SystemThreadingLock.cs"
+             Link="Compatibility\SystemThreadingLock.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      net48 的两处 SDK 行为与 net10 不同，必须手工补回（否则 OpenAiCompatibleClient 编译不过）：
+
+      1) System.Net.Http 在 net48 是独立程序集，SDK 不会自动引用 —— 少了它报
+         CS1069「此类型已转发到程序集 System.Net.Http」。
+      2) ImplicitUsings 在 net48 上【不含 System.Net.Http】（net10 才含）。
+         obj\<cfg>\net48\*.GlobalUsings.g.cs 实测只有 6 个命名空间：
+         System / System.Collections.Generic / System.IO / System.Linq /
+         System.Threading / System.Threading.Tasks。
+         所以源码里裸写的 HttpClient / HttpRequestMessage / HttpResponseMessage /
+         HttpContent / HttpMessageHandler / HttpRequestException 全部找不到类型。
+         加一条 <Using> 就等于把 net10 的隐式 using 补回来，【无需改任何 .cs】。
+    -->
+    <Reference Include="System.Net.Http" />
+    <Using Include="System.Net.Http" />
   </ItemGroup>
 
   <ItemGroup>

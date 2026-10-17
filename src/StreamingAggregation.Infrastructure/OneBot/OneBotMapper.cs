@@ -1,5 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using StreamingAggregation.Core.Diagnostics;
 using StreamingAggregation.Core.Models;
 
 namespace StreamingAggregation.Infrastructure.OneBot;
@@ -15,7 +16,7 @@ public static class OneBotMapper
     /// </summary>
     public static Message Map(OneBotEvent source)
     {
-        ArgumentNullException.ThrowIfNull(source);
+        Guard.NotNull(source);
 
         return Build(
             messageId: BuildMessageId(source),
@@ -32,7 +33,7 @@ public static class OneBotMapper
     /// </summary>
     public static Message Map(OneBotParseResult result)
     {
-        ArgumentNullException.ThrowIfNull(result);
+        Guard.NotNull(result);
 
         if (result.Event is null)
         {
@@ -114,7 +115,7 @@ public static class OneBotMapper
     }
 
     private static string BuildMessageId(OneBotEvent source)
-        => string.Create(
+        => string.Format(
             CultureInfo.InvariantCulture,
             $"g{source.GroupId}-u{source.UserId}-{source.Time.Ticks}");
 }
