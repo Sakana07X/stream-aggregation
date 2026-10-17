@@ -1,0 +1,63 @@
+<UserControl x:Class="StreamingAggregation.App.Navigation.NavShell"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             mc:Ignorable="d"
+             d:DesignWidth="1100" d:DesignHeight="720">
+
+  <!-- WPF UserControl 只能有一个子级：用根 Grid 的行列同时承载导航和遮罩 -->
+  <Grid>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="220"/>
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+
+    <!-- 左侧导航 -->
+    <Border Grid.Column="0" BorderThickness="0,0,1,0" BorderBrush="{DynamicResource {x:Static SystemColors.ControlLightBrushKey}}">
+      <DockPanel>
+        <Button DockPanel.Dock="Top"
+                Content="返回"
+                Style="{StaticResource DefaultButtonStyle}"
+                Margin="8,8,8,4"
+                Click="BackButton_Click"/>
+
+        <ListBox x:Name="NavList"
+                 BorderThickness="0"
+                 SelectionChanged="NavList_SelectionChanged">
+          <ListBoxItem Content="摘要" Tag="DigestPage" IsSelected="True" Style="{StaticResource NavItemStyle}"/>
+          <ListBoxItem Content="待办" Tag="TodoPage" Style="{StaticResource NavItemStyle}"/>
+          <ListBoxItem Content="消息" Tag="MessagesPage" Style="{StaticResource NavItemStyle}"/>
+          <ListBoxItem Content="设置" Tag="SettingsPage" Style="{StaticResource NavItemStyle}"/>
+        </ListBox>
+      </DockPanel>
+    </Border>
+
+    <!-- 右侧内容区 -->
+    <ContentControl x:Name="ContentFrame" Grid.Column="1"/>
+
+    <!-- 首启遮罩层：Grid.ColumnSpan=2 覆盖整个根 Grid（后声明 = 上层） -->
+    <Grid x:Name="WelcomeOverlay" Grid.ColumnSpan="2" Visibility="Collapsed"
+          Background="{DynamicResource {x:Static SystemColors.WindowBrushKey}}">
+      <Border HorizontalAlignment="Center" VerticalAlignment="Center"
+              Background="{DynamicResource {x:Static SystemColors.WindowBrushKey}}"
+              BorderThickness="1" BorderBrush="{DynamicResource {x:Static SystemColors.ControlLightBrushKey}}"
+              Padding="40,32" MaxWidth="480">
+        <StackPanel>
+          <TextBlock Text="欢迎使用流式聚合" Style="{StaticResource TitleTextStyle}" Margin="0,0,0,24"/>
+          <TextBlock Text="本工具从 QQ 群消息中提取重要信息和待办事项。" Style="{StaticResource BodyTextStyle}" Margin="0,0,0,24"/>
+
+          <TextBlock Text="配置步骤：" Style="{StaticResource SubtitleTextStyle}" Margin="0,0,0,12"/>
+          <TextBlock Text="1. 启动 SnowLuma 并开启 OneBot 正向 WebSocket" Style="{StaticResource BodyTextStyle}" Margin="0,0,0,8"/>
+          <TextBlock Text="2. 在设置页填写群白名单（每行一个群号）" Style="{StaticResource BodyTextStyle}" Margin="0,0,0,8"/>
+          <TextBlock Text="3. 填写模型 Endpoint 和 API Key" Style="{StaticResource BodyTextStyle}" Margin="0,0,0,24"/>
+
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Content="稍后再说" Style="{StaticResource DefaultButtonStyle}" Click="LaterButton_Click" Margin="0,0,8,0"/>
+            <Button Content="开始配置" Style="{StaticResource AccentButtonStyle}" Click="StartButton_Click"/>
+          </StackPanel>
+        </StackPanel>
+      </Border>
+    </Grid>
+  </Grid>
+</UserControl>

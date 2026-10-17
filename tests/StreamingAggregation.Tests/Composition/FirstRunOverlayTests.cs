@@ -47,6 +47,13 @@ public sealed class FirstRunOverlayTests
     private const string ShutdownModeResolverRelativePath =
         "src/StreamingAggregation.App/Services/ShutdownModeResolver.cs";
 
+    /// <summary><c>NavShell.xaml</c> 相对仓库根的路径。</summary>
+    private const string NavShellRelativePath = "src/StreamingAggregation.App/Navigation/NavShell.xaml";
+
+    /// <summary><c>NavShell.xaml.cs</c> 相对仓库根的路径。</summary>
+    private const string NavShellCodeBehindRelativePath =
+        "src/StreamingAggregation.App/Navigation/NavShell.xaml.cs";
+
     /// <summary><c>AppShell.cs</c> 相对仓库根的路径。</summary>
     private const string AppShellRelativePath = "src/StreamingAggregation.App/Composition/AppShell.cs";
 
@@ -254,38 +261,27 @@ public sealed class FirstRunOverlayTests
     }
 
     /// <summary>
-    /// 导航壳与首启遮罩层尚未交付，必须以显式 TODO 标记留在窗口壳里。
+    /// 导航壳与首启遮罩层已交付：NavShell 存在、遮罩层可见性受控、按钮接线完整。
     /// </summary>
-    /// <remarks>
-    /// 这是一条<b>阶段闸门</b>，不是功能断言：它保证"阶段 3/4 还欠导航壳和遮罩层"
-    /// 这件事不会随着阶段 2 的合并被人忘掉。等遮罩层真正落地时，
-    /// 请把本测试换回对 <c>WelcomeOverlay</c>、两个按钮接线与 <c>DismissAsync</c> 的断言。
-    /// </remarks>
     [Fact]
-    public void NavigationShellAndWelcomeOverlayAreDeferred()
+    public void NavigationShellAndWelcomeOverlayAreWired()
     {
         var xaml = RepositorySourceFile.Read(MainWindowRelativePath);
-        var codeBehind = RepositorySourceFile.Read(MainWindowCodeBehindRelativePath);
+        Assert.Contains("NavShell", xaml, StringComparison.Ordinal);
 
-        Assert.Contains("TODO(阶段 3)", xaml, StringComparison.Ordinal);
-        Assert.Contains("TODO(阶段 4)", xaml, StringComparison.Ordinal);
-        Assert.Contains("TODO(阶段 3)", codeBehind, StringComparison.Ordinal);
+        var navXaml = RepositorySourceFile.Read(NavShellRelativePath);
+        Assert.Contains("WelcomeOverlay", navXaml, StringComparison.Ordinal);
+        Assert.Contains("开始配置", navXaml, StringComparison.Ordinal);
+        Assert.Contains("稍后再说", navXaml, StringComparison.Ordinal);
 
-        Assert.False(
-            xaml.Contains("WelcomeOverlay", StringComparison.Ordinal),
-            "首启遮罩层仍留在 MainWindow.xaml：它属于阶段 4 的交付物，" +
-            "阶段 3 之前不该半迁移地留在窗口壳里。");
+        var navCodeBehind = RepositorySourceFile.Read(NavShellCodeBehindRelativePath);
+        Assert.Contains("StartButton_Click", navCodeBehind, StringComparison.Ordinal);
+        Assert.Contains("LaterButton_Click", navCodeBehind, StringComparison.Ordinal);
 
-        Assert.False(
-            codeBehind.Contains("StartConfigButton_Click", StringComparison.Ordinal)
-            || codeBehind.Contains("LaterButton_Click", StringComparison.Ordinal),
-            "遮罩层的按钮处理器仍留在 MainWindow.xaml.cs：阶段 4 会连同遮罩层一起补齐。");
-
-        // 但遮罩层所依赖的状态链路必须已经就绪，否则阶段 4 还要回头改组合根。
         var firstRunState = RepositorySourceFile.Read(FirstRunStateRelativePath);
         Assert.True(
             Regex.IsMatch(firstRunState, @"Task\s+DismissAsync\s*\(", RegexOptions.CultureInvariant),
-            "FirstRunState.DismissAsync 缺失，阶段 4 的「稍后再说」没有持久化入口。");
+            "FirstRunState.DismissAsync 缺失，「稍后再说」没有持久化入口。");
     }
 
     /// <summary>
